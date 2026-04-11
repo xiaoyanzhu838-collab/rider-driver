@@ -1,0 +1,3 @@
+dependencies:
+  espressif/icm42670: ^2.0.4
+
