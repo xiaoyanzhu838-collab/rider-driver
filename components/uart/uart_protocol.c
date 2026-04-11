@@ -85,7 +85,7 @@ static void send_read_response(int bus_id, uint8_t addr, const uint8_t *data, si
     uint8_t frame[PROTO_MAX_FRAME_LEN];
     frame[0] = PROTO_HEADER_0;
     frame[1] = PROTO_HEADER_1;
-    frame[2] = (uint8_t)(2 + data_len);  // LEN = TYPE(1) + ADDR(1) + DATA(n)
+    frame[2] = (uint8_t)frame_len;  // LEN = 整帧长度（含帧头/帧尾）
     frame[3] = PROTO_TYPE_READ;
     frame[4] = addr;
     if (data_len > 0 && data) {
@@ -346,13 +346,11 @@ static void process_frame(int bus_id, const uint8_t *frame, size_t frame_len)
     uint8_t addr = frame[PROTO_OFF_ADDR];
 
     if (type == PROTO_TYPE_READ) {
-        uint8_t payload_len = frame[PROTO_OFF_LEN];
         uint8_t read_len = 0;
 
-        // 兼容两种读请求：
-        // 1) 最小读请求: 55 00 02 02 ADDR CHECK 00 AA
-        // 2) 显式长度:   55 00 03 02 ADDR READ_LEN CHECK 00 AA
-        if (payload_len >= 3 && frame_len >= 9) {
+        // CM4/xgolib 读请求:
+        // 55 00 09 02 ADDR READ_LEN CHECK 00 AA
+        if (frame_len >= 9) {
             read_len = frame[PROTO_OFF_DATA];
         }
 
@@ -411,9 +409,8 @@ void proto_parser_feed(proto_parser_t *p, const uint8_t *data, size_t len)
 
         // 收到 LEN 字段后，检测是否已收齐整帧
         if (p->pos >= 3) {
-            // LEN 是 payload 长度 (TYPE+ADDR+DATA)，总帧长 = header(2)+LEN(1)+payload(LEN)+CHECK(1)+footer(2) = LEN+6
-            size_t payload_len = p->buf[PROTO_OFF_LEN];
-            size_t expected_len = payload_len + 6;
+            // LEN 是整帧长度（含帧头/帧尾）
+            size_t expected_len = p->buf[PROTO_OFF_LEN];
             if (expected_len < PROTO_MIN_FRAME_LEN || expected_len > PROTO_MAX_FRAME_LEN) {
                 // 不合法的长度，丢弃重新同步
                 ESP_LOGW(TAG, "invalid frame len=%u, resync", (unsigned)expected_len);

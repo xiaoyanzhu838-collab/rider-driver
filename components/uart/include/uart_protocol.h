@@ -13,7 +13,7 @@ extern "C" {
 // ============================================================
 // CM4 ↔ ESP32 串口协议
 // 帧格式: 55 00 LEN TYPE ADDR [DATA...] CHECK 00 AA
-//   LEN   = TYPE(1) + ADDR(1) + DATA(n)
+//   LEN   = 整帧长度（含帧头/帧尾）
 //   TYPE  = 0x01(写) / 0x02(读请求及读响应)
 //   ADDR  = 命令地址
 //   CHECK = 255 - ((LEN + TYPE + ADDR + sum(DATA)) % 256)
@@ -35,8 +35,8 @@ extern "C" {
 #define PROTO_OFF_ADDR      4
 #define PROTO_OFF_DATA      5
 
-// 最小帧长度：8字节（兼容 CM4/xgolib 最小读请求）
-// 例：55 00 02 02 ADDR CHECK 00 AA
+// 最小帧长度：8字节
+// 例：55 00 08 01 ADDR CHECK 00 AA
 #define PROTO_MIN_FRAME_LEN 8
 // 最大帧长度（合理上限）
 #define PROTO_MAX_FRAME_LEN 64

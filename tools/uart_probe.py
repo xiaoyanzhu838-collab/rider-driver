@@ -9,8 +9,9 @@
   3) 如果什么都没收到，说明物理链路有问题（接线/方向/波特率）
 
 协议帧格式:  55 00 LEN TYPE ADDR [DATA...] CHECK 00 AA
-  read firmware:  LEN=0x02, TYPE=0x02, ADDR=0x07, 无 DATA
-  CHECK = 255 - ((LEN + TYPE + ADDR) % 256) = 255 - ((2+2+7)%256) = 244 = 0xF4
+  LEN = 整帧长度（含帧头/帧尾）
+  read firmware: 55 00 09 02 07 0A E5 00 AA
+  CHECK = 255 - ((0x09 + 0x02 + 0x07 + 0x0A) % 256) = 0xE5
 """
 
 import serial
@@ -20,8 +21,8 @@ import time
 PORT = "/dev/ttyAMA0"
 BAUD = 115200
 
-# read firmware version 帧
-READ_FW_FRAME = bytes([0x55, 0x00, 0x02, 0x02, 0x07, 0xF4, 0x00, 0xAA])
+# read firmware version 帧（与 CM4/xgolib 保持一致）
+READ_FW_FRAME = bytes([0x55, 0x00, 0x09, 0x02, 0x07, 0x0A, 0xE5, 0x00, 0xAA])
 
 
 def main():
