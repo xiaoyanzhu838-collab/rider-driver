@@ -10,6 +10,7 @@
 #include "ahrs.h"
 #include "battery.h"
 #include "imu.h"
+#include "motor_control.h"
 #include "rgb_control.h"
 #include "rgb_effects.h"
 #include "rgb_service.h"
@@ -172,8 +173,16 @@ static void handle_read(int bus_id, uint8_t addr, uint8_t read_len)
     }
 
     case ADDR_READ_MOTOR_ANGLE: {
-        // 15字节电机角度（暂时返回全0）
+        // 15字节电机角度区，当前仅回填已接入的前两个电机位置（LE）
         memset(resp, 0, 15);
+        uint16_t positions[MOTOR_COUNT] = {0};
+        size_t count = 0;
+        if (motor_read_positions(positions, MOTOR_COUNT, &count) == ESP_OK) {
+            for (size_t i = 0; i < count && (i * 2 + 1) < sizeof(resp); i++) {
+                resp[i * 2] = (uint8_t)(positions[i] & 0xFF);
+                resp[i * 2 + 1] = (uint8_t)(positions[i] >> 8);
+            }
+        }
         resp_len = 15;
         break;
     }

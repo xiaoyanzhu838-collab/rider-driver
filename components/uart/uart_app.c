@@ -61,11 +61,9 @@ void uart_app_task(void *arg)
     ESP_ERROR_CHECK(uart_bus_register_rx_cb(UART_BUS_ID_CM4, on_uart_rx, NULL));
     ESP_ERROR_CHECK(uart_bus_start(UART_BUS_ID_CM4));
 
-    ESP_ERROR_CHECK(uart_bus_init(UART_BUS_ID_EXT, &cfg));
-    ESP_ERROR_CHECK(uart_bus_register_rx_cb(UART_BUS_ID_EXT, on_uart_rx, NULL));
-    ESP_ERROR_CHECK(uart_bus_start(UART_BUS_ID_EXT));
+    // EXT 总线(UART2) 已交由 motor 组件 (dxl_proto) 管理，不在此处初始化
 
-    ESP_LOGI(TAG, "dual-bus listening: CM4(UART1 TX=GPIO5 RX=GPIO4) + EXT(UART2 TX=GPIO14 RX=GPIO13)");
+    ESP_LOGI(TAG, "CM4 bus listening: UART1 TX=GPIO5 RX=GPIO4");
 
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(1000));

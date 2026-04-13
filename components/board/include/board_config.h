@@ -24,13 +24,18 @@
 // ========== FAN / PWM ==========
 #define BOARD_FAN_PWM_GPIO         (2)
 #define BOARD_FAN_PWM_FREQ_HZ      (25000)  // 25kHz, a common frequency for PC fans
-#define BOARD_FAN_DEFAULT_DUTY     (80)     // 60%
+#define BOARD_FAN_DEFAULT_DUTY     (60)     // 60%
 
 // ========== I2C / IMU ==========
 #define BOARD_I2C_SCL_GPIO         (19)
 #define BOARD_I2C_SDA_GPIO         (18)
 #define BOARD_ICM42670_ADDR        (0x69)   // AD0 is pulled high
 #define BOARD_IMU_SAMPLE_PERIOD_MS (5)      // 5ms -> 200Hz
+
+// ========== LED (板载指示灯，低电平点亮) ==========
+#define BOARD_LED_RED_GPIO         (22)
+#define BOARD_LED_BLUE_GPIO        (23)
+#define BOARD_LED_PWM_FREQ_HZ      (5000)   // 5kHz，适合 LED 调光
 
 // ========== BATTERY ADC ==========
 // 分压电路: GND --[10K]-- IO33 --[20K]-- BAT

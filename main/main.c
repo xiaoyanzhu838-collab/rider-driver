@@ -6,6 +6,7 @@
 #include "button_app.h"
 #include "fan_app.h"
 #include "imu_app.h"
+#include "motor_test.h"
 #include "rgb_app.h"
 #include "uart_app.h"
 
@@ -21,4 +22,5 @@ void app_main(void)
     xTaskCreate(fan_app_task, "fan_app", 2048, NULL, tskIDLE_PRIORITY + 1, NULL);
     xTaskCreate(button_app_task, "button_app", 2048, NULL, tskIDLE_PRIORITY + 2, NULL);
     xTaskCreate(imu_app_task, "imu_app", 4096, NULL, tskIDLE_PRIORITY + 3, NULL);
+    xTaskCreate(motor_test_task, "motor_test", 4096, NULL, tskIDLE_PRIORITY + 2, NULL);
 }
