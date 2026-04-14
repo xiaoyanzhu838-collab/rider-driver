@@ -10,6 +10,7 @@ typedef enum {
     RGB_EFFECT_OFF = 0,         // 强制全灭（保留，但业务上少用）
     RGB_EFFECT_STANDBY,         // 柔和待机（替代OFF，避免突兀）
     RGB_EFFECT_SOLID,
+    RGB_EFFECT_DIRECT,          // 直接像素输出（由 rgb_service 单任务落硬件）
     RGB_EFFECT_BREATH,
     RGB_EFFECT_RAINBOW,
     RGB_EFFECT_CHASE,

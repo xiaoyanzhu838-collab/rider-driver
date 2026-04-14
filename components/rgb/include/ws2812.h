@@ -23,6 +23,10 @@ esp_err_t ws2812_clear(void);
 
 esp_err_t ws2812_refresh(void);
 
+esp_err_t ws2812_lock(void);
+
+void ws2812_unlock(void);
+
 void ws2812_hsv_to_rgb(uint8_t h, uint8_t s, uint8_t v, uint8_t *r, uint8_t *g, uint8_t *b);
 
 #ifdef __cplusplus

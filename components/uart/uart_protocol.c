@@ -15,7 +15,6 @@
 #include "rgb_effects.h"
 #include "rgb_service.h"
 #include "uart_bus.h"
-#include "ws2812.h"
 
 static const char *TAG = "proto";
 
@@ -47,6 +46,17 @@ static void state_set_led(int idx, const uint8_t *rgb)
     s_state.led_rgb[idx][0] = rgb[0];
     s_state.led_rgb[idx][1] = rgb[1];
     s_state.led_rgb[idx][2] = rgb[2];
+    portEXIT_CRITICAL(&s_state_mux);
+}
+
+static void state_get_leds(uint8_t rgb[4][3])
+{
+    portENTER_CRITICAL(&s_state_mux);
+    for (int i = 0; i < 4; i++) {
+        rgb[i][0] = s_state.led_rgb[i][0];
+        rgb[i][1] = s_state.led_rgb[i][1];
+        rgb[i][2] = s_state.led_rgb[i][2];
+    }
     portEXIT_CRITICAL(&s_state_mux);
 }
 
@@ -216,15 +226,14 @@ static void handle_read(int bus_id, uint8_t addr, uint8_t read_len)
 // ============================================================
 static void apply_led_color(int led_idx, const uint8_t *rgb)
 {
+    uint8_t leds[4][3];
+
     state_set_led(led_idx, rgb);
+    state_get_leds(leds);
 
-    // CM4 通过协议控制单颗LED时，切到直接硬件控制模式
-    // 先确保 RGB 效果引擎不会覆盖我们的设置
-    rgb_control_set_enabled(false);
-
-    // 直接设置对应灯珠颜色
-    ws2812_set_pixel(led_idx, rgb[0], rgb[1], rgb[2]);
-    ws2812_refresh();
+    // CM4 通过协议控制 LED 时，只更新服务层状态；
+    // 真正的硬件刷新统一由 rgb_service 单任务完成。
+    (void)rgb_service_set_pixels(leds, 4);
 
     ESP_LOGI(TAG, "LED[%d] R=%u G=%u B=%u", led_idx, rgb[0], rgb[1], rgb[2]);
 }

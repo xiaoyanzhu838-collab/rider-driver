@@ -15,6 +15,7 @@ static const char *TAG = "rgb_service";
 
 static TaskHandle_t s_task;
 static atomic_bool s_running;
+static atomic_bool s_output_disabled;
 static portMUX_TYPE s_cfg_mux = portMUX_INITIALIZER_UNLOCKED;
 
 static rgb_effect_config_t s_cfg = {
@@ -25,6 +26,7 @@ static rgb_effect_config_t s_cfg = {
     .g = BOARD_RGB_DEFAULT_G,
     .b = BOARD_RGB_DEFAULT_B,
 };
+static uint8_t s_direct_pixels[BOARD_WS2812_LED_COUNT][3];
 
 static inline uint8_t tri_u8(uint16_t x)
 {
@@ -97,6 +99,23 @@ static void render_solid(int leds, const rgb_effect_config_t *cfg)
 
     for (int i = 0; i < leds; i++) {
         (void)ws2812_set_pixel(i, r, g, b);
+    }
+}
+
+static void render_direct(int leds)
+{
+    uint8_t pixels[BOARD_WS2812_LED_COUNT][3] = {0};
+
+    portENTER_CRITICAL(&s_cfg_mux);
+    for (int i = 0; i < leds && i < BOARD_WS2812_LED_COUNT; i++) {
+        pixels[i][0] = s_direct_pixels[i][0];
+        pixels[i][1] = s_direct_pixels[i][1];
+        pixels[i][2] = s_direct_pixels[i][2];
+    }
+    portEXIT_CRITICAL(&s_cfg_mux);
+
+    for (int i = 0; i < leds; i++) {
+        (void)ws2812_set_pixel(i, pixels[i][0], pixels[i][1], pixels[i][2]);
     }
 }
 
@@ -245,6 +264,9 @@ static void rgb_task(void *arg)
             case RGB_EFFECT_SOLID:
                 render_solid(leds, &cfg);
                 break;
+            case RGB_EFFECT_DIRECT:
+                render_direct(leds);
+                break;
             case RGB_EFFECT_BREATH:
                 render_breath(leds, &cfg, step * 8);
                 break;
@@ -269,7 +291,13 @@ static void rgb_task(void *arg)
                 break;
         }
 
-        (void)ws2812_refresh();
+        if (!atomic_load(&s_output_disabled)) {
+            esp_err_t err = ws2812_refresh();
+            if (err != ESP_OK) {
+                ESP_LOGE(TAG, "RGB output disabled after refresh failure: %s", esp_err_to_name(err));
+                atomic_store(&s_output_disabled, true);
+            }
+        }
 
         step++;
         vTaskDelay(pdMS_TO_TICKS(delay_ms));
@@ -289,6 +317,7 @@ esp_err_t rgb_service_start(void)
     }
 
     atomic_store(&s_running, true);
+    atomic_store(&s_output_disabled, false);
 
     BaseType_t ok = xTaskCreate(rgb_task, "rgb", 3072, NULL, tskIDLE_PRIORITY + 1, &s_task);
     ESP_RETURN_ON_FALSE(ok == pdPASS, ESP_ERR_NO_MEM, TAG, "create task failed");
@@ -325,5 +354,34 @@ esp_err_t rgb_service_set_mode(rgb_effect_t effect)
     s_cfg.effect = effect;
     portEXIT_CRITICAL(&s_cfg_mux);
 
+    return ESP_OK;
+}
+
+esp_err_t rgb_service_set_pixels(const uint8_t (*rgb)[3], size_t count)
+{
+    ESP_RETURN_ON_FALSE(rgb != NULL, ESP_ERR_INVALID_ARG, TAG, "rgb is NULL");
+
+    portENTER_CRITICAL(&s_cfg_mux);
+    for (size_t i = 0; i < BOARD_WS2812_LED_COUNT; i++) {
+        if (i < count) {
+            s_direct_pixels[i][0] = rgb[i][0];
+            s_direct_pixels[i][1] = rgb[i][1];
+            s_direct_pixels[i][2] = rgb[i][2];
+        } else {
+            s_direct_pixels[i][0] = 0;
+            s_direct_pixels[i][1] = 0;
+            s_direct_pixels[i][2] = 0;
+        }
+    }
+    s_cfg.effect = RGB_EFFECT_DIRECT;
+    portEXIT_CRITICAL(&s_cfg_mux);
+
+    return ESP_OK;
+}
+
+esp_err_t rgb_service_disable_output(void)
+{
+    atomic_store(&s_output_disabled, true);
+    ESP_LOGW(TAG, "RGB output manually disabled");
     return ESP_OK;
 }
