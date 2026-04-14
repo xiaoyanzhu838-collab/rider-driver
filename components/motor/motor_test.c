@@ -16,6 +16,10 @@ static const char *TAG = "motor_test";
 #define MOTOR_RUN_FULL_DIAGNOSTIC 0
 #endif
 
+#ifndef MOTOR_RUN_SIMPLE_DEMO
+#define MOTOR_RUN_SIMPLE_DEMO 1
+#endif
+
 // 已确认在线的目标 ID
 static const uint8_t TARGET_IDS[] = { 11, 12 };
 #define TARGET_COUNT (sizeof(TARGET_IDS) / sizeof(TARGET_IDS[0]))
@@ -206,6 +210,78 @@ static motor_profile_t profile_for_id(uint8_t id)
         return s_scan_results[idx].profile;
     }
     return MOTOR_PROFILE_SCSCL;
+}
+
+static uint16_t clamp_goal(uint16_t base, int delta)
+{
+    int goal = (int)base + delta;
+    if (goal < 80) {
+        goal = 80;
+    }
+    if (goal > 940) {
+        goal = 940;
+    }
+    return (uint16_t)goal;
+}
+
+static void run_simple_demo(void)
+{
+    const uint16_t speed = 120;
+    const int deltas[MOTOR_COUNT] = { 60, -60 };
+
+    ESP_LOGI(TAG, "===== SIMPLE MOTOR DEMO =====");
+
+    for (int i = 0; i < TARGET_COUNT; i++) {
+        uint8_t id = TARGET_IDS[i];
+        esp_err_t err = motor_set_torque(id, true);
+        ESP_LOGI(TAG, "  ID %u torque on: %s", id, esp_err_to_name(err));
+        vTaskDelay(pdMS_TO_TICKS(80));
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(300));
+
+    for (int i = 0; i < TARGET_COUNT; i++) {
+        uint8_t id = TARGET_IDS[i];
+        motor_feedback_t fb = {0};
+        esp_err_t err = motor_read_feedback(id, &fb);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "  ID %u read before move failed: %s", id, esp_err_to_name(err));
+            continue;
+        }
+
+        uint16_t start = fb.position;
+        uint16_t target = clamp_goal(start, deltas[i]);
+        ESP_LOGI(TAG, "  ID %u start=%u target=%u speed=%u", id, start, target, speed);
+
+        err = motor_set_position(id, target, speed);
+        ESP_LOGI(TAG, "  ID %u move out: %s", id, esp_err_to_name(err));
+        vTaskDelay(pdMS_TO_TICKS(1200));
+
+        err = motor_read_feedback(id, &fb);
+        if (err == ESP_OK) {
+            ESP_LOGI(TAG, "  ID %u mid pos=%u load=%u moving=%u", id, fb.position, fb.load, fb.moving);
+        }
+
+        err = motor_set_position(id, start, speed);
+        ESP_LOGI(TAG, "  ID %u move back: %s", id, esp_err_to_name(err));
+        vTaskDelay(pdMS_TO_TICKS(1200));
+
+        err = motor_read_feedback(id, &fb);
+        if (err == ESP_OK) {
+            ESP_LOGI(TAG, "  ID %u final pos=%u load=%u moving=%u", id, fb.position, fb.load, fb.moving);
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(200));
+    }
+
+    for (int i = 0; i < TARGET_COUNT; i++) {
+        uint8_t id = TARGET_IDS[i];
+        esp_err_t err = motor_set_torque(id, false);
+        ESP_LOGI(TAG, "  ID %u torque off: %s", id, esp_err_to_name(err));
+        vTaskDelay(pdMS_TO_TICKS(80));
+    }
+
+    ESP_LOGI(TAG, "===== SIMPLE MOTOR DEMO DONE =====");
 }
 
 // ============================================================
@@ -573,6 +649,9 @@ void motor_test_task(void *arg)
     vTaskDelay(pdMS_TO_TICKS(1000));  // 等设备上电稳定
 
 #if !MOTOR_RUN_FULL_DIAGNOSTIC
+#if MOTOR_RUN_SIMPLE_DEMO
+    run_simple_demo();
+#endif
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(10000));
     }
