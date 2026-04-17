@@ -1,7 +1,5 @@
 #include "ws2812.h"
 
-#include <string.h>
-
 #include "esp_check.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
@@ -14,8 +12,6 @@ static const char *TAG = "ws2812";
 static led_strip_handle_t s_strip;
 static int s_led_count;
 static SemaphoreHandle_t s_lock;
-static ws2812_config_t s_cfg;
-static bool s_cfg_valid;
 
 static esp_err_t ws2812_create_locked(const ws2812_config_t *cfg)
 {
@@ -32,7 +28,7 @@ static esp_err_t ws2812_create_locked(const ws2812_config_t *cfg)
     led_strip_rmt_config_t rmt_config = {
         .clk_src = RMT_CLK_SRC_DEFAULT,
         .resolution_hz = 10 * 1000 * 1000,
-        .mem_block_symbols = 64,
+        .mem_block_symbols = 0,
         .flags.with_dma = 0,
     };
 
@@ -41,43 +37,6 @@ static esp_err_t ws2812_create_locked(const ws2812_config_t *cfg)
         s_led_count = cfg->led_count;
     }
     return err;
-}
-
-static esp_err_t ws2812_recover_locked(void)
-{
-    ESP_RETURN_ON_FALSE(s_cfg_valid, ESP_ERR_INVALID_STATE, TAG, "config not saved");
-
-    ESP_LOGW(TAG, "attempting to recover WS2812 RMT channel");
-
-    if (s_strip != NULL) {
-        esp_err_t del_err = led_strip_del(s_strip);
-        if (del_err != ESP_OK) {
-            ESP_LOGW(TAG, "delete old strip failed: %s", esp_err_to_name(del_err));
-        }
-        s_strip = NULL;
-        s_led_count = 0;
-    }
-
-    esp_err_t err = ws2812_create_locked(&s_cfg);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "recreate strip failed: %s", esp_err_to_name(err));
-        return err;
-    }
-
-    err = led_strip_clear(s_strip);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "clear after recover failed: %s", esp_err_to_name(err));
-        return err;
-    }
-
-    err = led_strip_refresh(s_strip);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "refresh after recover failed: %s", esp_err_to_name(err));
-        return err;
-    }
-
-    ESP_LOGW(TAG, "WS2812 RMT channel recovered");
-    return ESP_OK;
 }
 
 esp_err_t ws2812_lock(void)
@@ -114,9 +73,6 @@ esp_err_t ws2812_init(const ws2812_config_t *cfg)
         ws2812_unlock();
         return ESP_OK;
     }
-
-    s_cfg = *cfg;
-    s_cfg_valid = true;
 
     esp_err_t err = ws2812_create_locked(cfg);
     if (err != ESP_OK) {
@@ -155,10 +111,6 @@ esp_err_t ws2812_clear(void)
     if (err == ESP_OK) {
         err = led_strip_refresh(s_strip);
     }
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "clear/refresh failed: %s", esp_err_to_name(err));
-        err = ws2812_recover_locked();
-    }
     ws2812_unlock();
     return err;
 }
@@ -168,13 +120,6 @@ esp_err_t ws2812_refresh(void)
     ESP_RETURN_ON_FALSE(s_strip != NULL, ESP_ERR_INVALID_STATE, TAG, "not initialized");
     ESP_RETURN_ON_ERROR(ws2812_lock(), TAG, "lock failed");
     esp_err_t err = led_strip_refresh(s_strip);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "refresh failed: %s", esp_err_to_name(err));
-        err = ws2812_recover_locked();
-        if (err == ESP_OK) {
-            err = led_strip_refresh(s_strip);
-        }
-    }
     ws2812_unlock();
     return err;
 }

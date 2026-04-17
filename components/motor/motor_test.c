@@ -24,15 +24,19 @@ static const char *TAG = "motor_test";
 //   1 = 运行简单双电机往复演示（默认）
 // ============================================================
 #ifndef MOTOR_RUN_FULL_DIAGNOSTIC
-#define MOTOR_RUN_FULL_DIAGNOSTIC 0
+#define MOTOR_RUN_FULL_DIAGNOSTIC 1
 #endif
 
 #ifndef MOTOR_RUN_SIMPLE_DEMO
 #define MOTOR_RUN_SIMPLE_DEMO 0
 #endif
 
+#ifndef MOTOR_RUN_FOCUSED_BOUNDARY
+#define MOTOR_RUN_FOCUSED_BOUNDARY 1
+#endif
+
 // 需要测试的舵机 ID 列表
-static const uint8_t TARGET_IDS[] = { 11, 12 };
+static const uint8_t TARGET_IDS[] = { 12, 22 };
 #define TARGET_COUNT (sizeof(TARGET_IDS) / sizeof(TARGET_IDS[0]))
 
 // ============================================================
@@ -294,6 +298,170 @@ static uint16_t clamp_goal(uint16_t base, int delta)
         goal = 940;
     }
     return (uint16_t)goal;
+}
+
+static int16_t speed_raw_to_signed(uint16_t raw)
+{
+    return (int16_t)raw;
+}
+
+static uint16_t load_mag_10bit(uint16_t raw)
+{
+    return raw & 0x03FF;
+}
+
+static uint8_t load_dir_10bit(uint16_t raw)
+{
+    return (raw & 0x0400) ? 1 : 0;
+}
+
+static uint16_t load_mag_11bit(uint16_t raw)
+{
+    return raw & 0x07FF;
+}
+
+static uint8_t load_dir_11bit(uint16_t raw)
+{
+    return (raw & 0x0800) ? 1 : 0;
+}
+
+static int abs_diff_u16(uint16_t a, uint16_t b)
+{
+    return (a >= b) ? (int)(a - b) : (int)(b - a);
+}
+
+static bool read_present_position(uint8_t id, motor_profile_t profile, uint16_t *out_pos)
+{
+    if (!out_pos) {
+        return false;
+    }
+
+    const motor_profile_addrs_t *addrs = get_profile_addrs(profile);
+    uint8_t pos_addr = addrs ? addrs->present_position_l : SCS_ADDR_PRESENT_POSITION_L;
+    scs_status_t st = {0};
+    esp_err_t err = scs_read(id, pos_addr, 2, &st);
+    if (err != ESP_OK || st.param_count < 2) {
+        ESP_LOGW(TAG, "  ID %u read present pos failed: %s (addr=%u)",
+                 id, esp_err_to_name(err), pos_addr);
+        return false;
+    }
+
+    *out_pos = st.params[0] | ((uint16_t)st.params[1] << 8);
+    return true;
+}
+
+static bool read_feedback_for_profile(uint8_t id, motor_profile_t profile,
+                                      motor_feedback_t *out_fb, uint8_t *out_err)
+{
+    if (!out_fb) {
+        return false;
+    }
+
+    const motor_profile_addrs_t *addrs = get_profile_addrs(profile);
+    uint8_t pos_addr = addrs ? addrs->present_position_l : SCS_ADDR_PRESENT_POSITION_L;
+    scs_status_t st = {0};
+    if (scs_read(id, pos_addr, 6, &st) != ESP_OK || st.param_count < 6) {
+        return false;
+    }
+
+    memset(out_fb, 0, sizeof(*out_fb));
+    out_fb->id = id;
+    out_fb->position = st.params[0] | ((uint16_t)st.params[1] << 8);
+    out_fb->speed = st.params[2] | ((uint16_t)st.params[3] << 8);
+    out_fb->load = st.params[4] | ((uint16_t)st.params[5] << 8);
+    (void)scs_read_byte(id, SCS_ADDR_PRESENT_VOLTAGE, &out_fb->voltage);
+    (void)scs_read_byte(id, SCS_ADDR_PRESENT_TEMPERATURE, &out_fb->temperature);
+    (void)scs_read_byte(id, SCS_ADDR_MOVING, &out_fb->moving);
+
+    if (out_err) {
+        *out_err = st.error;
+    }
+    return true;
+}
+
+static bool read_word_with_status(uint8_t id, uint8_t addr, uint16_t *out_val, uint8_t *out_err)
+{
+    if (!out_val) {
+        return false;
+    }
+
+    scs_status_t st = {0};
+    if (scs_read(id, addr, 2, &st) != ESP_OK || st.param_count < 2) {
+        return false;
+    }
+
+    *out_val = st.params[0] | ((uint16_t)st.params[1] << 8);
+    if (out_err) {
+        *out_err = st.error;
+    }
+    return true;
+}
+
+static bool read_byte_with_status(uint8_t id, uint8_t addr, uint8_t *out_val, uint8_t *out_err)
+{
+    if (!out_val) {
+        return false;
+    }
+
+    scs_status_t st = {0};
+    if (scs_read(id, addr, 1, &st) != ESP_OK || st.param_count < 1) {
+        return false;
+    }
+
+    *out_val = st.params[0];
+    if (out_err) {
+        *out_err = st.error;
+    }
+    return true;
+}
+
+static void log_goal_latch(const char *label, uint8_t id, motor_profile_t profile)
+{
+    const motor_profile_addrs_t *addrs = get_profile_addrs(profile);
+    if (!addrs) {
+        ESP_LOGW(TAG, "%s ID=%u skip: unknown profile", label, id);
+        return;
+    }
+
+    uint16_t goal_pos = 0;
+    uint16_t goal_speed = 0;
+    uint8_t torque = 0;
+    uint8_t err_pos = 0;
+    uint8_t err_speed = 0;
+    uint8_t err_torque = 0;
+    bool ok_pos = read_word_with_status(id, addrs->goal_position_l, &goal_pos, &err_pos);
+    bool ok_speed = read_word_with_status(id, addrs->goal_speed_l, &goal_speed, &err_speed);
+    bool ok_torque = read_byte_with_status(id, addrs->torque_enable, &torque, &err_torque);
+
+    if (!ok_pos || !ok_speed || !ok_torque) {
+        ESP_LOGW(TAG, "%s ID=%u latch read failed", label, id);
+        return;
+    }
+
+    ESP_LOGI(TAG,
+             "%s ID=%u torque=%u goal=%u speed=%u err_pos=0x%02X err_speed=0x%02X err_torque=0x%02X",
+             label, id, torque, goal_pos, goal_speed, err_pos, err_speed, err_torque);
+}
+
+static void trace_motion(const char *label, uint8_t id, motor_profile_t profile,
+                         int samples, int interval_ms)
+{
+    for (int i = 0; i < samples; i++) {
+        motor_feedback_t fb = {0};
+        uint8_t err = 0;
+        if (read_feedback_for_profile(id, profile, &fb, &err)) {
+            int16_t speed_s16 = speed_raw_to_signed(fb.speed);
+            ESP_LOGI(TAG,
+                     "TRACE %s ID=%u sample=%02d pos=%u speed_raw=%u speed_s16=%d load_raw=%u load10=%u dir10=%u load11=%u dir11=%u moving=%u volt=%u temp=%u err=0x%02X",
+                     label, id, i, fb.position, fb.speed, speed_s16, fb.load,
+                     load_mag_10bit(fb.load), load_dir_10bit(fb.load),
+                     load_mag_11bit(fb.load), load_dir_11bit(fb.load),
+                     fb.moving, fb.voltage, fb.temperature, err);
+        } else {
+            ESP_LOGW(TAG, "TRACE %s ID=%u sample=%02d read failed", label, id, i);
+        }
+        vTaskDelay(pdMS_TO_TICKS(interval_ms));
+    }
 }
 
 // ============================================================
@@ -688,40 +856,26 @@ static esp_err_t write_goal_for_profile(uint8_t id, motor_profile_t profile,
  * 3. 等待 2 秒让电机运动完成
  * 4. 读回位置验证是否到达
  */
-static void step_write_and_verify(uint8_t id, uint16_t speed, uint8_t acc)
+static void step_write_and_verify(uint8_t id, int delta, uint16_t speed, uint8_t acc)
 {
     motor_profile_t profile = profile_for_id(id);
     const motor_profile_addrs_t *addrs = get_profile_addrs(profile);
-    uint8_t pos_addr = addrs ? addrs->present_position_l : SCS_ADDR_PRESENT_POSITION_L;
     uint16_t before = 0;
     bool before_valid = false;
 
-    ESP_LOGI(TAG, "===== WritePos ID=%u speed=%u acc=%u profile=%s =====",
-             id, speed, acc, addrs ? addrs->name : "unknown");
+    ESP_LOGI(TAG, "===== WritePos ID=%u delta=%d speed=%u acc=%u profile=%s =====",
+             id, delta, speed, acc, addrs ? addrs->name : "unknown");
 
     // 读取运动前的位置
-    {
-        scs_status_t st = {0};
-        scs_read(id, pos_addr, 2, &st);
-        if (st.param_count >= 2) {
-            before = st.params[0] | ((uint16_t)st.params[1] << 8);
-            before_valid = true;
-            ESP_LOGI(TAG, "  before: pos=%u (0x%04X) from addr=%u", before, before, pos_addr);
-        }
+    if (read_present_position(id, profile, &before)) {
+        before_valid = true;
+        ESP_LOGI(TAG, "  before: pos=%u (0x%04X)", before, before);
     }
     vTaskDelay(pdMS_TO_TICKS(20));
 
-    // 计算目标位置：在当前位置基础上偏移 +50
-    int16_t goal_pos = before_valid ? (int16_t)(before + 50) : 600;
-    if (profile == MOTOR_PROFILE_LEGACY_DXL) {
-        // Legacy DXL 位置范围较小（0~1023），需要额外安全检查
-        if (goal_pos > 900) {
-            goal_pos = (int16_t)(before - 50);
-        }
-        if (goal_pos < 100) {
-            goal_pos = 100;
-        }
-    }
+    // 计算目标位置：在当前位置基础上按指定偏移做小步运动
+    uint16_t base = before_valid ? before : 600;
+    int16_t goal_pos = (int16_t)clamp_goal(base, delta);
 
     ESP_LOGI(TAG, "  target goal=%d", goal_pos);
 
@@ -734,13 +888,459 @@ static void step_write_and_verify(uint8_t id, uint16_t speed, uint8_t acc)
 
     // 读回运动后的位置，验证是否到达
     {
-        scs_status_t st = {0};
-        scs_read(id, pos_addr, 2, &st);
-        if (st.param_count >= 2) {
-            uint16_t after = st.params[0] | ((uint16_t)st.params[1] << 8);
-            ESP_LOGI(TAG, "  after:  pos=%u (0x%04X) from addr=%u", after, after, pos_addr);
+        uint16_t after = 0;
+        if (read_present_position(id, profile, &after)) {
+            ESP_LOGI(TAG, "  after:  pos=%u (0x%04X)", after, after);
         }
     }
+}
+
+static void step_sync_write_legacy_pair(uint16_t speed)
+{
+    if (TARGET_COUNT < 2) {
+        return;
+    }
+
+    const uint8_t id_a = TARGET_IDS[0];
+    const uint8_t id_b = TARGET_IDS[1];
+    const motor_profile_t profile_a = profile_for_id(id_a);
+    const motor_profile_t profile_b = profile_for_id(id_b);
+
+    if (profile_a != MOTOR_PROFILE_LEGACY_DXL || profile_b != MOTOR_PROFILE_LEGACY_DXL) {
+        const motor_profile_addrs_t *addrs_a = get_profile_addrs(profile_a);
+        const motor_profile_addrs_t *addrs_b = get_profile_addrs(profile_b);
+        ESP_LOGW(TAG,
+                 "skip sync_write(0x1E,4): need legacy pair, got %s / %s",
+                 addrs_a ? addrs_a->name : "unknown",
+                 addrs_b ? addrs_b->name : "unknown");
+        return;
+    }
+
+    uint16_t before_a = 0;
+    uint16_t before_b = 0;
+    if (!read_present_position(id_a, profile_a, &before_a) ||
+        !read_present_position(id_b, profile_b, &before_b)) {
+        ESP_LOGW(TAG, "skip sync_write pair: failed to read starting positions");
+        return;
+    }
+
+    const uint16_t goal_a = clamp_goal(before_a, +40);
+    const uint16_t goal_b = clamp_goal(before_b, -40);
+    uint8_t pair_data[10] = {
+        id_a,
+        (uint8_t)(goal_a & 0xFF),
+        (uint8_t)(goal_a >> 8),
+        (uint8_t)(speed & 0xFF),
+        (uint8_t)(speed >> 8),
+        id_b,
+        (uint8_t)(goal_b & 0xFF),
+        (uint8_t)(goal_b >> 8),
+        (uint8_t)(speed & 0xFF),
+        (uint8_t)(speed >> 8),
+    };
+
+    ESP_LOGI(TAG,
+             "===== SYNC_WRITE legacy pair addr=0x%02X len=4 =====", SCS_ADDR_GOAL_POSITION_L);
+    ESP_LOGI(TAG,
+             "  before: ID %u=%u, ID %u=%u", id_a, before_a, id_b, before_b);
+    ESP_LOGI(TAG,
+             "  goal:   ID %u=%u speed=%u, ID %u=%u speed=%u",
+             id_a, goal_a, speed, id_b, goal_b, speed);
+
+    esp_err_t err = scs_sync_write(SCS_ADDR_GOAL_POSITION_L, 4, pair_data, 2);
+    ESP_LOGI(TAG, "  sync_write move: %s", esp_err_to_name(err));
+    vTaskDelay(pdMS_TO_TICKS(2000));
+
+    uint16_t after_move_a = 0;
+    uint16_t after_move_b = 0;
+    if (read_present_position(id_a, profile_a, &after_move_a) &&
+        read_present_position(id_b, profile_b, &after_move_b)) {
+        ESP_LOGI(TAG,
+                 "  after move: ID %u=%u, ID %u=%u",
+                 id_a, after_move_a, id_b, after_move_b);
+    }
+
+    pair_data[1] = (uint8_t)(before_a & 0xFF);
+    pair_data[2] = (uint8_t)(before_a >> 8);
+    pair_data[6] = (uint8_t)(before_b & 0xFF);
+    pair_data[7] = (uint8_t)(before_b >> 8);
+
+    err = scs_sync_write(SCS_ADDR_GOAL_POSITION_L, 4, pair_data, 2);
+    ESP_LOGI(TAG, "  sync_write restore: %s", esp_err_to_name(err));
+    vTaskDelay(pdMS_TO_TICKS(2000));
+
+    uint16_t after_restore_a = 0;
+    uint16_t after_restore_b = 0;
+    if (read_present_position(id_a, profile_a, &after_restore_a) &&
+        read_present_position(id_b, profile_b, &after_restore_b)) {
+        ESP_LOGI(TAG,
+                 "  after restore: ID %u=%u, ID %u=%u",
+                 id_a, after_restore_a, id_b, after_restore_b);
+    }
+}
+
+static void run_probe_with_trace_ex(uint8_t id, int delta, uint16_t speed, uint8_t acc,
+                                    int samples, int interval_ms)
+{
+    motor_profile_t profile = profile_for_id(id);
+    const motor_profile_addrs_t *addrs = get_profile_addrs(profile);
+    uint16_t base = 0;
+    if (!read_present_position(id, profile, &base)) {
+        ESP_LOGW(TAG, "probe ID=%u read base failed", id);
+        return;
+    }
+
+    uint16_t goal = clamp_goal(base, delta);
+    ESP_LOGI(TAG,
+             "===== PROBE ID=%u delta=%d speed=%u acc=%u base=%u goal=%u samples=%d interval=%d profile=%s =====",
+             id, delta, speed, acc, base, goal, samples, interval_ms,
+             addrs ? addrs->name : "unknown");
+
+    esp_err_t err = write_goal_for_profile(id, profile, (int16_t)goal, speed, acc);
+    ESP_LOGI(TAG, "  probe write: %s", esp_err_to_name(err));
+    log_goal_latch("LATCH", id, profile);
+    trace_motion("probe", id, profile, samples, interval_ms);
+
+    err = write_goal_for_profile(id, profile, (int16_t)base, speed, acc);
+    ESP_LOGI(TAG, "  probe restore: %s", esp_err_to_name(err));
+    log_goal_latch("RESTORE_LATCH", id, profile);
+    trace_motion("restore", id, profile, samples, interval_ms);
+}
+
+static void run_probe_with_trace(uint8_t id, int delta, uint16_t speed, uint8_t acc)
+{
+    run_probe_with_trace_ex(id, delta, speed, acc, 8, 200);
+}
+
+static void step_characterize_motor(uint8_t id, int preferred_sign)
+{
+    const int delta_cases[] = {
+        40 * preferred_sign,
+        80 * preferred_sign,
+        -40 * preferred_sign,
+        -80 * preferred_sign,
+    };
+    const uint16_t speed_cases[] = { 80, 200, 400 };
+
+    ESP_LOGI(TAG, "===== CHARACTERIZE ID=%u preferred_sign=%+d =====", id, preferred_sign);
+
+    for (int i = 0; i < (int)(sizeof(delta_cases) / sizeof(delta_cases[0])); i++) {
+        run_probe_with_trace(id, delta_cases[i], 200, 20);
+        vTaskDelay(pdMS_TO_TICKS(300));
+    }
+
+    for (int i = 0; i < (int)(sizeof(speed_cases) / sizeof(speed_cases[0])); i++) {
+        run_probe_with_trace(id, 80 * preferred_sign, speed_cases[i], 20);
+        vTaskDelay(pdMS_TO_TICKS(300));
+    }
+}
+
+static void step_speed_profile_free_direction(uint8_t id, int free_sign)
+{
+    const uint16_t speed_cases[] = { 80, 200, 400 };
+
+    ESP_LOGI(TAG, "===== FREE-DIR SPEED PROFILE ID=%u free_sign=%+d =====", id, free_sign);
+    for (int i = 0; i < (int)(sizeof(speed_cases) / sizeof(speed_cases[0])); i++) {
+        run_probe_with_trace_ex(id, 80 * free_sign, speed_cases[i], 20, 20, 50);
+        vTaskDelay(pdMS_TO_TICKS(300));
+    }
+}
+
+static int step_free_direction_sweep(uint8_t id, int free_sign)
+{
+    const int abs_deltas[] = { 40, 80, 120, 160, 200, 240, 280, 320 };
+    const uint16_t speed = 200;
+    const uint8_t acc = 20;
+    const int settle_ms = 700;
+    const int reach_tolerance = 6;
+    motor_profile_t profile = profile_for_id(id);
+    const motor_profile_addrs_t *addrs = get_profile_addrs(profile);
+    uint16_t base = 0;
+    int max_good_abs_delta = 0;
+
+    if (!read_present_position(id, profile, &base)) {
+        ESP_LOGW(TAG, "FREE SWEEP ID=%u read base failed", id);
+        return 0;
+    }
+
+    ESP_LOGI(TAG,
+             "===== FREE SWEEP ID=%u free_sign=%+d base=%u profile=%s =====",
+             id, free_sign, base, addrs ? addrs->name : "unknown");
+
+    for (int i = 0; i < (int)(sizeof(abs_deltas) / sizeof(abs_deltas[0])); i++) {
+        const int abs_delta = abs_deltas[i];
+        const int delta = abs_delta * free_sign;
+        const uint16_t goal = clamp_goal(base, delta);
+        motor_feedback_t fb = {0};
+        uint8_t err_bits = 0;
+        esp_err_t err = write_goal_for_profile(id, profile, (int16_t)goal, speed, acc);
+
+        if (goal == base) {
+            ESP_LOGI(TAG, "  FREE SWEEP ID=%u abs_delta=%d skipped: goal clamped to base", id, abs_delta);
+            break;
+        }
+
+        ESP_LOGI(TAG, "  FREE SWEEP ID=%u step abs_delta=%d delta=%+d goal=%u write=%s",
+                 id, abs_delta, delta, goal, esp_err_to_name(err));
+        if (err != ESP_OK) {
+            break;
+        }
+
+        log_goal_latch("SWEEP_LATCH", id, profile);
+        vTaskDelay(pdMS_TO_TICKS(settle_ms));
+
+        if (!read_feedback_for_profile(id, profile, &fb, &err_bits)) {
+            ESP_LOGW(TAG, "  FREE SWEEP ID=%u abs_delta=%d readback failed", id, abs_delta);
+            break;
+        }
+
+        const int pos_err = abs_diff_u16(fb.position, goal);
+        const bool reached = pos_err <= reach_tolerance;
+        const bool overload = (err_bits & 0x20) != 0;
+        ESP_LOGI(TAG,
+                 "  FREE SWEEP ID=%u abs_delta=%d goal=%u pos=%u pos_err=%d speed_raw=%u speed_s16=%d load_raw=%u load10=%u dir10=%u load11=%u dir11=%u err=0x%02X reached=%u overload=%u",
+                 id, abs_delta, goal, fb.position, pos_err, fb.speed, speed_raw_to_signed(fb.speed),
+                 fb.load, load_mag_10bit(fb.load), load_dir_10bit(fb.load),
+                 load_mag_11bit(fb.load), load_dir_11bit(fb.load),
+                 err_bits, reached ? 1 : 0, overload ? 1 : 0);
+
+        if (reached && !overload) {
+            max_good_abs_delta = abs_delta;
+            continue;
+        }
+
+        ESP_LOGW(TAG,
+                 "  FREE SWEEP ID=%u stop at abs_delta=%d (reached=%u overload=%u)",
+                 id, abs_delta, reached ? 1 : 0, overload ? 1 : 0);
+        break;
+    }
+
+    {
+        esp_err_t err = write_goal_for_profile(id, profile, (int16_t)base, speed, acc);
+        motor_feedback_t fb = {0};
+        uint8_t err_bits = 0;
+        ESP_LOGI(TAG, "  FREE SWEEP ID=%u restore base=%u write=%s",
+                 id, base, esp_err_to_name(err));
+        vTaskDelay(pdMS_TO_TICKS(900));
+        if (read_feedback_for_profile(id, profile, &fb, &err_bits)) {
+            ESP_LOGI(TAG,
+                     "  FREE SWEEP ID=%u restore pos=%u speed_raw=%u speed_s16=%d load_raw=%u load10=%u dir10=%u load11=%u dir11=%u err=0x%02X",
+                     id, fb.position, fb.speed, speed_raw_to_signed(fb.speed),
+                     fb.load, load_mag_10bit(fb.load), load_dir_10bit(fb.load),
+                     load_mag_11bit(fb.load), load_dir_11bit(fb.load), err_bits);
+        }
+    }
+
+    ESP_LOGI(TAG, "===== FREE SWEEP RESULT ID=%u max_good_abs_delta=%d =====",
+             id, max_good_abs_delta);
+    return max_good_abs_delta;
+}
+
+static void step_speed_profile_large_stroke(uint8_t id, int free_sign, int max_good_abs_delta)
+{
+    const uint16_t speed_cases[] = { 80, 200, 400 };
+    int test_abs_delta = max_good_abs_delta;
+
+    if (test_abs_delta > 160) {
+        test_abs_delta = 160;
+    }
+    if (test_abs_delta < 120) {
+        ESP_LOGW(TAG,
+                 "skip large-stroke speed profile ID=%u: max_good_abs_delta=%d too small",
+                 id, max_good_abs_delta);
+        return;
+    }
+
+    ESP_LOGI(TAG,
+             "===== LARGE-STROKE SPEED PROFILE ID=%u free_sign=%+d delta=%d =====",
+             id, free_sign, test_abs_delta);
+    for (int i = 0; i < (int)(sizeof(speed_cases) / sizeof(speed_cases[0])); i++) {
+        run_probe_with_trace_ex(id, test_abs_delta * free_sign, speed_cases[i], 20, 24, 50);
+        vTaskDelay(pdMS_TO_TICKS(300));
+    }
+}
+
+static int step_boundary_fine_sweep(uint8_t id, int free_sign)
+{
+    const int abs_deltas[] = { 90, 100, 110, 120, 130 };
+    const uint16_t speed = 200;
+    const uint8_t acc = 20;
+    const int settle_ms = 900;
+    const int reach_tolerance = 6;
+    motor_profile_t profile = profile_for_id(id);
+    const motor_profile_addrs_t *addrs = get_profile_addrs(profile);
+    uint16_t base = 0;
+    int last_good_abs_delta = 0;
+    int first_fail_abs_delta = 0;
+
+    if (!read_present_position(id, profile, &base)) {
+        ESP_LOGW(TAG, "BOUNDARY FINE SWEEP ID=%u read base failed", id);
+        return 0;
+    }
+
+    ESP_LOGI(TAG,
+             "===== BOUNDARY FINE SWEEP ID=%u free_sign=%+d base=%u profile=%s =====",
+             id, free_sign, base, addrs ? addrs->name : "unknown");
+
+    for (int i = 0; i < (int)(sizeof(abs_deltas) / sizeof(abs_deltas[0])); i++) {
+        const int abs_delta = abs_deltas[i];
+        const int delta = abs_delta * free_sign;
+        const uint16_t goal = clamp_goal(base, delta);
+        motor_feedback_t fb = {0};
+        uint8_t err_bits = 0;
+        esp_err_t err = write_goal_for_profile(id, profile, (int16_t)goal, speed, acc);
+
+        if (goal == base) {
+            break;
+        }
+
+        ESP_LOGI(TAG, "  BOUNDARY FINE ID=%u step abs_delta=%d delta=%+d goal=%u write=%s",
+                 id, abs_delta, delta, goal, esp_err_to_name(err));
+        if (err != ESP_OK) {
+            first_fail_abs_delta = abs_delta;
+            break;
+        }
+
+        log_goal_latch("BOUNDARY_LATCH", id, profile);
+        vTaskDelay(pdMS_TO_TICKS(settle_ms));
+
+        if (!read_feedback_for_profile(id, profile, &fb, &err_bits)) {
+            first_fail_abs_delta = abs_delta;
+            ESP_LOGW(TAG, "  BOUNDARY FINE ID=%u abs_delta=%d readback failed", id, abs_delta);
+            break;
+        }
+
+        {
+            const int pos_err = abs_diff_u16(fb.position, goal);
+            const bool reached = pos_err <= reach_tolerance;
+            const bool overload = (err_bits & 0x20) != 0;
+            ESP_LOGI(TAG,
+                     "  BOUNDARY FINE ID=%u abs_delta=%d goal=%u pos=%u pos_err=%d speed_raw=%u speed_s16=%d load_raw=%u load10=%u dir10=%u load11=%u dir11=%u err=0x%02X reached=%u overload=%u",
+                     id, abs_delta, goal, fb.position, pos_err, fb.speed, speed_raw_to_signed(fb.speed),
+                     fb.load, load_mag_10bit(fb.load), load_dir_10bit(fb.load),
+                     load_mag_11bit(fb.load), load_dir_11bit(fb.load),
+                     err_bits, reached ? 1 : 0, overload ? 1 : 0);
+            if (reached && !overload) {
+                last_good_abs_delta = abs_delta;
+            } else {
+                first_fail_abs_delta = abs_delta;
+                break;
+            }
+        }
+    }
+
+    {
+        esp_err_t err = write_goal_for_profile(id, profile, (int16_t)base, speed, acc);
+        ESP_LOGI(TAG, "  BOUNDARY FINE ID=%u restore base=%u write=%s",
+                 id, base, esp_err_to_name(err));
+        vTaskDelay(pdMS_TO_TICKS(900));
+    }
+
+    ESP_LOGI(TAG,
+             "===== BOUNDARY FINE RESULT ID=%u last_good_abs_delta=%d first_fail_abs_delta=%d =====",
+             id, last_good_abs_delta, first_fail_abs_delta);
+    return first_fail_abs_delta ? first_fail_abs_delta : last_good_abs_delta;
+}
+
+static void step_boundary_trace(uint8_t id, int free_sign, int abs_delta)
+{
+    if (abs_delta <= 0) {
+        return;
+    }
+
+    ESP_LOGI(TAG,
+             "===== BOUNDARY TRACE ID=%u free_sign=%+d abs_delta=%d =====",
+             id, free_sign, abs_delta);
+    run_probe_with_trace_ex(id, abs_delta * free_sign, 80, 20, 24, 100);
+    vTaskDelay(pdMS_TO_TICKS(300));
+    run_probe_with_trace_ex(id, abs_delta * free_sign, 200, 20, 24, 100);
+    vTaskDelay(pdMS_TO_TICKS(300));
+    run_probe_with_trace_ex(id, abs_delta * free_sign, 400, 20, 24, 100);
+}
+
+static int step_precision_boundary_sweep(uint8_t id, int free_sign,
+                                         int start_abs_delta, int end_abs_delta, int step_abs)
+{
+    const uint16_t speed = 200;
+    const uint8_t acc = 20;
+    const int settle_ms = 1200;
+    const int reach_tolerance = 6;
+    motor_profile_t profile = profile_for_id(id);
+    const motor_profile_addrs_t *addrs = get_profile_addrs(profile);
+    uint16_t base = 0;
+    int last_good_abs_delta = 0;
+    int first_fail_abs_delta = 0;
+
+    if (step_abs <= 0) {
+        return 0;
+    }
+    if (!read_present_position(id, profile, &base)) {
+        ESP_LOGW(TAG, "PRECISION SWEEP ID=%u read base failed", id);
+        return 0;
+    }
+
+    ESP_LOGI(TAG,
+             "===== PRECISION SWEEP ID=%u free_sign=%+d base=%u range=%d..%d step=%d profile=%s =====",
+             id, free_sign, base, start_abs_delta, end_abs_delta, step_abs,
+             addrs ? addrs->name : "unknown");
+
+    for (int abs_delta = start_abs_delta; abs_delta <= end_abs_delta; abs_delta += step_abs) {
+        const int delta = abs_delta * free_sign;
+        const uint16_t goal = clamp_goal(base, delta);
+        motor_feedback_t fb = {0};
+        uint8_t err_bits = 0;
+        esp_err_t err = write_goal_for_profile(id, profile, (int16_t)goal, speed, acc);
+
+        if (goal == base) {
+            break;
+        }
+
+        ESP_LOGI(TAG, "  PRECISION ID=%u step abs_delta=%d delta=%+d goal=%u write=%s",
+                 id, abs_delta, delta, goal, esp_err_to_name(err));
+        if (err != ESP_OK) {
+            first_fail_abs_delta = abs_delta;
+            break;
+        }
+
+        log_goal_latch("PRECISION_LATCH", id, profile);
+        vTaskDelay(pdMS_TO_TICKS(settle_ms));
+
+        if (!read_feedback_for_profile(id, profile, &fb, &err_bits)) {
+            first_fail_abs_delta = abs_delta;
+            ESP_LOGW(TAG, "  PRECISION ID=%u abs_delta=%d readback failed", id, abs_delta);
+            break;
+        }
+
+        {
+            const int pos_err = abs_diff_u16(fb.position, goal);
+            const bool reached = pos_err <= reach_tolerance;
+            const bool overload = (err_bits & 0x20) != 0;
+            ESP_LOGI(TAG,
+                     "  PRECISION ID=%u abs_delta=%d goal=%u pos=%u pos_err=%d speed_raw=%u speed_s16=%d load_raw=%u load10=%u dir10=%u load11=%u dir11=%u err=0x%02X reached=%u overload=%u",
+                     id, abs_delta, goal, fb.position, pos_err, fb.speed, speed_raw_to_signed(fb.speed),
+                     fb.load, load_mag_10bit(fb.load), load_dir_10bit(fb.load),
+                     load_mag_11bit(fb.load), load_dir_11bit(fb.load),
+                     err_bits, reached ? 1 : 0, overload ? 1 : 0);
+            if (reached && !overload) {
+                last_good_abs_delta = abs_delta;
+            } else {
+                first_fail_abs_delta = abs_delta;
+                break;
+            }
+        }
+    }
+
+    {
+        esp_err_t err = write_goal_for_profile(id, profile, (int16_t)base, speed, acc);
+        ESP_LOGI(TAG, "  PRECISION ID=%u restore base=%u write=%s",
+                 id, base, esp_err_to_name(err));
+        vTaskDelay(pdMS_TO_TICKS(900));
+    }
+
+    ESP_LOGI(TAG,
+             "===== PRECISION RESULT ID=%u last_good_abs_delta=%d first_fail_abs_delta=%d =====",
+             id, last_good_abs_delta, first_fail_abs_delta);
+    return first_fail_abs_delta ? first_fail_abs_delta : last_good_abs_delta;
 }
 
 // ============================================================
@@ -756,7 +1356,7 @@ void motor_test_task(void *arg)
 
     ESP_LOGI(TAG, "======================================");
     ESP_LOGI(TAG, "  Motor bus task");
-    ESP_LOGI(TAG, "  IDs: 11, 12");
+    ESP_LOGI(TAG, "  IDs: %u, %u", TARGET_IDS[0], TARGET_IDS[1]);
     ESP_LOGI(TAG, "  Baud: 1000000");
     ESP_LOGI(TAG, "  Diagnostic on boot: %s", MOTOR_RUN_FULL_DIAGNOSTIC ? "ON" : "OFF");
     ESP_LOGI(TAG, "======================================");
@@ -770,6 +1370,8 @@ void motor_test_task(void *arg)
     }
 
     vTaskDelay(pdMS_TO_TICKS(1000));  // 等待舵机上电稳定
+    ESP_LOGI(TAG, "  Attach window: waiting 8000 ms before diagnostics");
+    vTaskDelay(pdMS_TO_TICKS(8000));
 
 #if !MOTOR_RUN_FULL_DIAGNOSTIC
     // ---- 非诊断模式：运行简单演示后进入空闲 ----
@@ -799,6 +1401,52 @@ void motor_test_task(void *arg)
         vTaskDelay(pdMS_TO_TICKS(500));
     }
 
+#if MOTOR_RUN_FOCUSED_BOUNDARY
+    ESP_LOGI(TAG, "===== FOCUSED BOUNDARY MODE =====");
+
+    step_torque_all(0);
+    vTaskDelay(pdMS_TO_TICKS(500));
+    step_torque_all(1);
+    vTaskDelay(pdMS_TO_TICKS(500));
+
+    {
+        int precise_12 = step_precision_boundary_sweep(TARGET_IDS[0], -1, 100, 110, 1);
+        vTaskDelay(pdMS_TO_TICKS(500));
+        int precise_22 = step_precision_boundary_sweep(TARGET_IDS[1], +1, 110, 120, 1);
+        vTaskDelay(pdMS_TO_TICKS(500));
+
+        step_boundary_trace(TARGET_IDS[0], -1, precise_12);
+        vTaskDelay(pdMS_TO_TICKS(500));
+        step_boundary_trace(TARGET_IDS[1], +1, precise_22);
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+
+    step_torque_all(0);
+
+    ESP_LOGI(TAG, "======================================");
+    ESP_LOGI(TAG, "  Focused boundary test COMPLETE. Torque OFF.");
+    ESP_LOGI(TAG, "======================================");
+
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(10000));
+        ESP_LOGI(TAG, "--- periodic read ---");
+        for (int i = 0; i < TARGET_COUNT; i++) {
+            uint8_t id = TARGET_IDS[i];
+            motor_profile_t profile = profile_for_id(id);
+            const motor_profile_addrs_t *addrs = get_profile_addrs(profile);
+            uint8_t pos_addr = addrs ? addrs->present_position_l : SCS_ADDR_PRESENT_POSITION_L;
+            scs_status_t st = {0};
+            esp_err_t read_err = scs_read(id, pos_addr, 2, &st);
+            if (read_err == ESP_OK) {
+                print_status("POS", id, &st);
+            } else {
+                ESP_LOGW(TAG, "POS ID=%u read failed: %s", id, esp_err_to_name(read_err));
+            }
+            vTaskDelay(pdMS_TO_TICKS(30));
+        }
+    }
+#endif
+
     // Step 4: 安全运动测试（仅在确认寄存器布局正确后执行）
     ESP_LOGI(TAG, "===== WRITE tests (safe) =====");
 
@@ -810,9 +1458,54 @@ void motor_test_task(void *arg)
     step_torque_all(1);
     vTaskDelay(pdMS_TO_TICKS(500));
 
-    // 小步位置测试（仅 ID 11）
-    step_write_and_verify(TARGET_IDS[0], 200, 20);
+    // 逐个小步位置测试
+    step_write_and_verify(TARGET_IDS[0], +40, 200, 20);
     vTaskDelay(pdMS_TO_TICKS(500));
+    step_write_and_verify(TARGET_IDS[1], -40, 200, 20);
+    vTaskDelay(pdMS_TO_TICKS(500));
+
+    // 对 Legacy/DXL 风格寄存器做一次双电机同步写验证
+    step_sync_write_legacy_pair(180);
+    vTaskDelay(pdMS_TO_TICKS(500));
+
+    // Step 5: 细化单电机驱动特性
+    step_characterize_motor(TARGET_IDS[0], +1);
+    vTaskDelay(pdMS_TO_TICKS(500));
+    step_characterize_motor(TARGET_IDS[1], -1);
+    vTaskDelay(pdMS_TO_TICKS(500));
+
+    // Step 6: 针对已观察到的“好使方向”补一轮更高时间分辨率的速度特性测试
+    step_speed_profile_free_direction(TARGET_IDS[0], -1);
+    vTaskDelay(pdMS_TO_TICKS(500));
+    step_speed_profile_free_direction(TARGET_IDS[1], +1);
+    vTaskDelay(pdMS_TO_TICKS(500));
+
+    // Step 7: 沿自由方向继续扫程，确认机械可用范围与更大步长下的速度特性
+    {
+        int max_good_12 = step_free_direction_sweep(TARGET_IDS[0], -1);
+        vTaskDelay(pdMS_TO_TICKS(500));
+        int max_good_22 = step_free_direction_sweep(TARGET_IDS[1], +1);
+        vTaskDelay(pdMS_TO_TICKS(500));
+
+        step_speed_profile_large_stroke(TARGET_IDS[0], -1, max_good_12);
+        vTaskDelay(pdMS_TO_TICKS(500));
+        step_speed_profile_large_stroke(TARGET_IDS[1], +1, max_good_22);
+        vTaskDelay(pdMS_TO_TICKS(500));
+
+        if (max_good_12 < 120) {
+            int boundary_12 = step_boundary_fine_sweep(TARGET_IDS[0], -1);
+            vTaskDelay(pdMS_TO_TICKS(500));
+            step_boundary_trace(TARGET_IDS[0], -1, boundary_12);
+            vTaskDelay(pdMS_TO_TICKS(500));
+        }
+
+        if (max_good_22 < 120) {
+            int boundary_22 = step_boundary_fine_sweep(TARGET_IDS[1], +1);
+            vTaskDelay(pdMS_TO_TICKS(500));
+            step_boundary_trace(TARGET_IDS[1], +1, boundary_22);
+            vTaskDelay(pdMS_TO_TICKS(500));
+        }
+    }
 
     // 卸力结束
     step_torque_all(0);

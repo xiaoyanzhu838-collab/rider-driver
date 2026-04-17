@@ -12,12 +12,12 @@ esp_err_t rgb_control_set_enabled(bool enable)
 {
     atomic_store(&s_enabled, enable);
 
-    // 关闭时进入柔和待机：不全灭，避免突兀
+    // 关闭时保持全灭，避免后台持续刷新带来的额外干扰
     if (!enable) {
-        return rgb_service_set_mode(RGB_EFFECT_STANDBY);
+        return rgb_service_set_mode(RGB_EFFECT_OFF);
     }
 
-    // 开启时恢复到更高级的默认效果
+    // 开启时恢复默认效果
     return rgb_service_set_mode(RGB_EFFECT_AURORA);
 }
 

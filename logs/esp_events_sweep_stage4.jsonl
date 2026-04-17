@@ -1,0 +1,6 @@
+{"host_ts": "2026-04-17 00:58:56.231", "kind": "proto1_tx", "device": "scs", "summary": "scs TX PING id=12", "decoded": {"target_id": 12, "length": 2, "opcode": 1, "opcode_name": "PING", "params": [], "checksum": 240}}
+{"host_ts": "2026-04-17 00:58:56.280", "kind": "proto1_tx", "device": "scs", "summary": "scs TX 0x00 id=12", "decoded": {"target_id": 12, "length": 2, "opcode": 0, "opcode_name": "0x00", "params": [], "checksum": 241}}
+{"host_ts": "2026-04-17 00:58:56.284", "kind": "status_params", "source": "motor_test", "label": "PING", "motor_id": 12, "error": 0, "params": []}
+{"host_ts": "2026-04-17 00:58:56.326", "kind": "proto1_tx", "device": "scs", "summary": "scs TX PING id=22", "decoded": {"target_id": 22, "length": 2, "opcode": 1, "opcode_name": "PING", "params": [], "checksum": 230}}
+{"host_ts": "2026-04-17 00:58:56.380", "kind": "proto1_tx", "device": "scs", "summary": "scs TX 0x00 id=22", "decoded": {"target_id": 22, "length": 2, "opcode": 0, "opcode_name": "0x00", "params": [], "checksum": 231}}
+{"host_ts": "2026-04-17 00:58:56.385", "kind": "status_params", "source": "motor_test", "label": "PING", "motor_id": 22, "error": 0, "params": []}
