@@ -39,3 +39,76 @@ void motor_test_task(void *arg);
  * @param arg FreeRTOS 任务参数（未使用）
  */
 void motor_explore_task(void *arg);
+
+/**
+ * @brief 四节点只读识别任务
+ *
+ * 本任务用于对 UART2 上当前在线的 `11 / 12 / 21 / 22` 四个节点做一轮
+ * 只读识别：
+ * - 先将 `12 / 22` 拉到安全的 20% 展开位，避免刮机身
+ * - 再对四个节点执行 PING / 逐字节寄存器扫描 / 多字节读取
+ * - 不对 `11 / 21` 下发运动命令
+ *
+ * @param arg FreeRTOS 任务参数（未使用）
+ */
+void motor_identify_four_nodes_task(void *arg);
+
+/**
+ * @brief 轮毂节点主动探测任务
+ *
+ * 用于在保证 `12 / 22` 已安全展开的前提下，
+ * 对 `11 / 21` 做最小风险的主动探测：
+ * - 重新确认协议 profile
+ * - 验证 torque on/off
+ * - 做极小位置步进与恢复
+ *
+ * @param arg FreeRTOS 任务参数（未使用）
+ */
+void motor_probe_wheels_task(void *arg);
+
+/**
+ * @brief 轮毂节点驱动语义探测任务
+ *
+ * 在保证 `12 / 22` 已安全展开的前提下，对 `11 / 21` 继续做低风险探测：
+ * - 当前位置保持写入是否真的能“保持”
+ * - 单独改 `goal_speed` 是否会改变轮子行为
+ * - 相同小步目标在不同 speed 下的反馈差异
+ *
+ * 用于判断 `11 / 21` 更接近哪种驱动语义。
+ *
+ * @param arg FreeRTOS 任务参数（未使用）
+ */
+void motor_probe_wheel_drive_task(void *arg);
+
+/**
+ * @brief 轮毂节点方向语义探测任务
+ *
+ * 在 `12 / 22` 已安全展开后，聚焦探测 `11 / 21` 的方向控制：
+ * - `goal_position` 的正/负大偏移是否会改变转向
+ * - 经典 DXL 风格的 speed 方向位是否有效
+ *
+ * @param arg FreeRTOS 任务参数（未使用）
+ */
+void motor_probe_wheel_direction_task(void *arg);
+
+/**
+ * @brief 轮毂节点控制接口探测任务
+ *
+ * 在 `12 / 22` 已安全展开后，继续验证 `11 / 21` 的最小可用控制接口：
+ * - `goal_speed` 的低速死区与稳定起转范围
+ * - `speed = 0` 是否可作为主动停转命令
+ * - `torque off` 与 `speed = 0` 的停转差异
+ *
+ * @param arg FreeRTOS 任务参数（未使用）
+ */
+void motor_probe_wheel_control_task(void *arg);
+
+/**
+ * @brief 轮毂节点中间速度档位补测任务
+ *
+ * 只对 `21` 做较窄范围的速度补测，用于补齐 `20 / 25 / 30 / 40`
+ * 这几个关键档位的起转阈值结论。
+ *
+ * @param arg FreeRTOS 任务参数（未使用）
+ */
+void motor_probe_wheel_midrange_task(void *arg);

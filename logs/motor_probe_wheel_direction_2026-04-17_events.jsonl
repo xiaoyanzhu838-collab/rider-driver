@@ -1,0 +1,11 @@
+{"host_ts": "2026-04-17 22:45:54.213", "kind": "profile", "source": "motor_test", "profile": "Legacy DXL-like"}
+{"host_ts": "2026-04-17 22:45:54.424", "kind": "status_params", "source": "motor_test", "label": "READ(3,2)", "motor_id": 11, "error": 0, "params": [11, 1]}
+{"host_ts": "2026-04-17 22:45:54.511", "kind": "status_params", "source": "motor_test", "label": "READ(36,6)", "motor_id": 11, "error": 0, "params": [242, 2, 0, 0, 253, 255]}
+{"host_ts": "2026-04-17 22:45:54.590", "kind": "status_params", "source": "motor_test", "label": "READ(62,1)", "motor_id": 11, "error": 0, "params": [255]}
+{"host_ts": "2026-04-17 22:45:54.689", "kind": "status_params", "source": "motor_test", "label": "READ(24,1)", "motor_id": 11, "error": 0, "params": [0]}
+{"host_ts": "2026-04-17 22:46:27.447", "kind": "status_params", "source": "motor_test", "label": "WHEEL_DIRECTION_PING", "motor_id": 21, "error": 0, "params": []}
+{"host_ts": "2026-04-17 22:46:32.656", "kind": "profile", "source": "motor_test", "profile": "Legacy DXL-like"}
+{"host_ts": "2026-04-17 22:46:32.872", "kind": "status_params", "source": "motor_test", "label": "READ(3,2)", "motor_id": 21, "error": 0, "params": [21, 1]}
+{"host_ts": "2026-04-17 22:46:32.964", "kind": "status_params", "source": "motor_test", "label": "READ(36,6)", "motor_id": 21, "error": 0, "params": [7, 1, 0, 0, 252, 255]}
+{"host_ts": "2026-04-17 22:46:33.052", "kind": "status_params", "source": "motor_test", "label": "READ(62,1)", "motor_id": 21, "error": 0, "params": [1]}
+{"host_ts": "2026-04-17 22:46:33.131", "kind": "status_params", "source": "motor_test", "label": "READ(24,1)", "motor_id": 21, "error": 0, "params": [0]}

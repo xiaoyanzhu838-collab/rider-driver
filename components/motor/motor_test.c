@@ -40,6 +40,13 @@ static const uint8_t TARGET_IDS[] = { 12, 22 };
 #define TARGET_COUNT (sizeof(TARGET_IDS) / sizeof(TARGET_IDS[0]))
 #define EXPLORATION_SETTLE_MS 120
 
+static const uint8_t IDENTIFY_IDS[] = { 11, 12, 21, 22 };
+#define IDENTIFY_COUNT (sizeof(IDENTIFY_IDS) / sizeof(IDENTIFY_IDS[0]))
+#define SAFE_OPEN_20_GOAL_12 578
+#define SAFE_OPEN_20_GOAL_22 461
+static const uint8_t WHEEL_IDS[] = { 11, 21 };
+#define WHEEL_COUNT (sizeof(WHEEL_IDS) / sizeof(WHEEL_IDS[0]))
+
 // ============================================================
 // 电机型号识别（Profile Detection）
 //
@@ -71,6 +78,11 @@ typedef struct {
     uint8_t acc_addr;               // 加速度寄存器地址（如果使用）
     const char *name;               // Profile 名称（用于日志输出）
 } motor_profile_addrs_t;
+
+static esp_err_t write_goal_for_profile(uint8_t id, motor_profile_t profile,
+                                        int16_t goal_pos, uint16_t speed, uint8_t acc);
+static int forward_delta_mod1024(uint16_t prev, uint16_t curr);
+static int shortest_delta_mod1024(uint16_t from, uint16_t to);
 
 /**
  * @brief 寄存器扫描结果
@@ -447,21 +459,44 @@ static void log_goal_latch(const char *label, uint8_t id, motor_profile_t profil
 static void trace_motion(const char *label, uint8_t id, motor_profile_t profile,
                          int samples, int interval_ms)
 {
+    bool have_prev = false;
+    uint16_t prev_pos = 0;
+    int total_forward = 0;
+    int total_shortest = 0;
+    int nonzero_steps = 0;
+
     for (int i = 0; i < samples; i++) {
         motor_feedback_t fb = {0};
         uint8_t err = 0;
         if (read_feedback_for_profile(id, profile, &fb, &err)) {
             int16_t speed_s16 = speed_raw_to_signed(fb.speed);
+            if (have_prev) {
+                int step_forward = forward_delta_mod1024(prev_pos, fb.position);
+                int step_shortest = shortest_delta_mod1024(prev_pos, fb.position);
+                total_forward += step_forward;
+                total_shortest += step_shortest;
+                if (step_forward != 0) {
+                    nonzero_steps++;
+                }
+            }
             ESP_LOGI(TAG,
                      "TRACE %s ID=%u sample=%02d pos=%u speed_raw=%u speed_s16=%d load_raw=%u load10=%u dir10=%u load11=%u dir11=%u moving=%u volt=%u temp=%u err=0x%02X",
                      label, id, i, fb.position, fb.speed, speed_s16, fb.load,
                      load_mag_10bit(fb.load), load_dir_10bit(fb.load),
                      load_mag_11bit(fb.load), load_dir_11bit(fb.load),
                      fb.moving, fb.voltage, fb.temperature, err);
+            prev_pos = fb.position;
+            have_prev = true;
         } else {
             ESP_LOGW(TAG, "TRACE %s ID=%u sample=%02d read failed", label, id, i);
         }
         vTaskDelay(pdMS_TO_TICKS(interval_ms));
+    }
+
+    if (have_prev && samples > 1) {
+        ESP_LOGI(TAG,
+                 "TRACE %s SUMMARY ID=%u samples=%d total_forward=%d total_shortest=%d nonzero_steps=%d",
+                 label, id, samples, total_forward, total_shortest, nonzero_steps);
     }
 }
 
@@ -580,7 +615,7 @@ static void step_ping_all(void)
 //   2. 自动识别舵机型号（Profile Detection）
 //   3. 排查通信异常（对比标准寄存器值是否合理）
 // ============================================================
-static void step_register_scan(uint8_t id)
+static motor_profile_t step_register_scan(uint8_t id)
 {
     ESP_LOGI(TAG, "===== REGISTER SCAN ID=%u (addr 0..70, 1 byte each) =====", id);
 
@@ -726,6 +761,7 @@ static void step_register_scan(uint8_t id)
         s_scan_results[idx].profile = profile;
         s_scan_results[idx].valid = true;
     }
+    return profile;
 }
 
 // ============================================================
@@ -735,9 +771,8 @@ static void step_register_scan(uint8_t id)
 // 使用 READ(id, addr, N) 一次读取 N 个连续字节，
 // 验证单字节扫描和多字节读取的结果是否一致。
 // ============================================================
-static void step_read_multi(uint8_t id)
+static void step_read_multi_with_profile(uint8_t id, motor_profile_t profile)
 {
-    motor_profile_t profile = profile_for_id(id);
     const motor_profile_addrs_t *addrs = get_profile_addrs(profile);
     uint8_t pos_addr = addrs ? addrs->present_position_l : SCS_ADDR_PRESENT_POSITION_L;
     uint8_t torque_addr = addrs ? addrs->torque_enable : SCS_ADDR_TORQUE_ENABLE;
@@ -795,6 +830,401 @@ static void step_read_multi(uint8_t id)
         }
         vTaskDelay(pdMS_TO_TICKS(30));
     }
+}
+
+static void step_read_multi(uint8_t id)
+{
+    step_read_multi_with_profile(id, profile_for_id(id));
+}
+
+static void move_servo_pair_to_safe_open_20(void)
+{
+    motor_feedback_t fb12 = {0};
+    motor_feedback_t fb22 = {0};
+
+    ESP_LOGI(TAG, "===== SAFE OPEN PRESET =====");
+    ESP_LOGI(TAG, "  moving servo 12 -> %u, servo 22 -> %u", SAFE_OPEN_20_GOAL_12, SAFE_OPEN_20_GOAL_22);
+
+    ESP_LOGI(TAG, "  torque on 12: %s", esp_err_to_name(motor_set_torque(12, true)));
+    vTaskDelay(pdMS_TO_TICKS(60));
+    ESP_LOGI(TAG, "  torque on 22: %s", esp_err_to_name(motor_set_torque(22, true)));
+    vTaskDelay(pdMS_TO_TICKS(60));
+
+    ESP_LOGI(TAG, "  set pos 12: %s",
+             esp_err_to_name(motor_set_position(12, SAFE_OPEN_20_GOAL_12, 200)));
+    vTaskDelay(pdMS_TO_TICKS(80));
+    ESP_LOGI(TAG, "  set pos 22: %s",
+             esp_err_to_name(motor_set_position(22, SAFE_OPEN_20_GOAL_22, 200)));
+
+    vTaskDelay(pdMS_TO_TICKS(1800));
+
+    if (motor_read_feedback(12, &fb12) == ESP_OK) {
+        ESP_LOGI(TAG, "  safe open confirm ID12 pos=%u load=%u moving=%u",
+                 fb12.position, fb12.load, fb12.moving);
+    } else {
+        ESP_LOGW(TAG, "  safe open confirm ID12 read failed");
+    }
+
+    if (motor_read_feedback(22, &fb22) == ESP_OK) {
+        ESP_LOGI(TAG, "  safe open confirm ID22 pos=%u load=%u moving=%u",
+                 fb22.position, fb22.load, fb22.moving);
+    } else {
+        ESP_LOGW(TAG, "  safe open confirm ID22 read failed");
+    }
+}
+
+static uint16_t clamp_goal_legacy_full(int goal)
+{
+    if (goal < 0) {
+        return 0;
+    }
+    if (goal > 1023) {
+        return 1023;
+    }
+    return (uint16_t)goal;
+}
+
+static uint16_t wrap_goal_legacy_mod1024(uint16_t base, int delta)
+{
+    int goal = (int)base + delta;
+    while (goal < 0) {
+        goal += 1024;
+    }
+    while (goal > 1023) {
+        goal -= 1024;
+    }
+    return (uint16_t)goal;
+}
+
+static int forward_delta_mod1024(uint16_t prev, uint16_t curr)
+{
+    return (curr >= prev) ? (int)(curr - prev) : (int)(curr + 1024 - prev);
+}
+
+static int shortest_delta_mod1024(uint16_t from, uint16_t to)
+{
+    int delta = (int)to - (int)from;
+    while (delta > 512) {
+        delta -= 1024;
+    }
+    while (delta < -512) {
+        delta += 1024;
+    }
+    return delta;
+}
+
+static void log_feedback_snapshot(const char *label, uint8_t id, motor_profile_t profile)
+{
+    motor_feedback_t fb = {0};
+    uint8_t err_bits = 0;
+    if (read_feedback_for_profile(id, profile, &fb, &err_bits)) {
+        ESP_LOGI(TAG,
+                 "%s ID=%u pos=%u speed_raw=%u speed_s16=%d load_raw=%u moving=%u volt=%u temp=%u err=0x%02X",
+                 label, id, fb.position, fb.speed, speed_raw_to_signed(fb.speed),
+                 fb.load, fb.moving, fb.voltage, fb.temperature, err_bits);
+    } else {
+        ESP_LOGW(TAG, "%s ID=%u read feedback failed", label, id);
+    }
+}
+
+static void wheel_torque_probe(uint8_t id, motor_profile_t profile)
+{
+    const motor_profile_addrs_t *addrs = get_profile_addrs(profile);
+    uint8_t torque_before = 0;
+    uint8_t torque_after_on = 0;
+    uint8_t torque_after_off = 0;
+
+    ESP_LOGI(TAG, "===== WHEEL TORQUE PROBE ID=%u =====", id);
+    if (!read_byte_with_status(id,
+                               addrs ? addrs->torque_enable : SCS_ADDR_TORQUE_ENABLE,
+                               &torque_before,
+                               NULL)) {
+        ESP_LOGW(TAG, "WHEEL TORQUE ID=%u baseline read failed", id);
+        return;
+    }
+    ESP_LOGI(TAG, "WHEEL TORQUE ID=%u baseline=%u", id, torque_before);
+    log_feedback_snapshot("WHEEL_TORQUE_BASE", id, profile);
+
+    ESP_LOGI(TAG, "WHEEL TORQUE ID=%u -> ON (%s)",
+             id, esp_err_to_name(scs_write_byte(id,
+                                                addrs ? addrs->torque_enable : SCS_ADDR_TORQUE_ENABLE,
+                                                1)));
+    vTaskDelay(pdMS_TO_TICKS(250));
+    (void)read_byte_with_status(id,
+                                addrs ? addrs->torque_enable : SCS_ADDR_TORQUE_ENABLE,
+                                &torque_after_on,
+                                NULL);
+    log_feedback_snapshot("WHEEL_TORQUE_ON", id, profile);
+
+    ESP_LOGI(TAG, "WHEEL TORQUE ID=%u -> OFF (%s)",
+             id, esp_err_to_name(scs_write_byte(id,
+                                                addrs ? addrs->torque_enable : SCS_ADDR_TORQUE_ENABLE,
+                                                0)));
+    vTaskDelay(pdMS_TO_TICKS(250));
+    (void)read_byte_with_status(id,
+                                addrs ? addrs->torque_enable : SCS_ADDR_TORQUE_ENABLE,
+                                &torque_after_off,
+                                NULL);
+    log_feedback_snapshot("WHEEL_TORQUE_OFF", id, profile);
+
+    ESP_LOGI(TAG, "WHEEL TORQUE SUMMARY ID=%u baseline=%u after_on=%u after_off=%u",
+             id, torque_before, torque_after_on, torque_after_off);
+}
+
+static void wheel_position_probe(uint8_t id, motor_profile_t profile, int delta)
+{
+    uint16_t base = 0;
+    uint16_t goal = 0;
+    uint16_t restore = 0;
+    const uint16_t speed = 40;
+    const uint8_t acc = 10;
+    const motor_profile_addrs_t *addrs = get_profile_addrs(profile);
+
+    ESP_LOGI(TAG, "===== WHEEL POSITION PROBE ID=%u delta=%+d =====", id, delta);
+    if (!read_present_position(id, profile, &base)) {
+        ESP_LOGW(TAG, "WHEEL POS ID=%u baseline pos read failed", id);
+        return;
+    }
+
+    goal = clamp_goal_legacy_full((int)base + delta);
+    restore = base;
+    ESP_LOGI(TAG, "WHEEL POS ID=%u base=%u goal=%u restore=%u speed=%u",
+             id, base, goal, restore, speed);
+
+    ESP_LOGI(TAG, "WHEEL POS ID=%u torque on -> %s",
+             id, esp_err_to_name(scs_write_byte(id,
+                                                addrs ? addrs->torque_enable : SCS_ADDR_TORQUE_ENABLE,
+                                                1)));
+    vTaskDelay(pdMS_TO_TICKS(120));
+    log_goal_latch("WHEEL_BEFORE_MOVE", id, profile);
+    log_feedback_snapshot("WHEEL_BEFORE_MOVE_FB", id, profile);
+
+    ESP_LOGI(TAG, "WHEEL POS ID=%u write goal=%u -> %s",
+             id, goal, esp_err_to_name(write_goal_for_profile(id, profile, (int16_t)goal, speed, acc)));
+    log_goal_latch("WHEEL_AFTER_WRITE", id, profile);
+    trace_motion("WHEEL_MOVE", id, profile, 12, 120);
+
+    ESP_LOGI(TAG, "WHEEL POS ID=%u restore goal=%u -> %s",
+             id, restore, esp_err_to_name(write_goal_for_profile(id, profile, (int16_t)restore, speed, acc)));
+    log_goal_latch("WHEEL_AFTER_RESTORE_WRITE", id, profile);
+    trace_motion("WHEEL_RESTORE", id, profile, 12, 120);
+
+    ESP_LOGI(TAG, "WHEEL POS ID=%u torque off -> %s",
+             id, esp_err_to_name(scs_write_byte(id,
+                                                addrs ? addrs->torque_enable : SCS_ADDR_TORQUE_ENABLE,
+                                                0)));
+    vTaskDelay(pdMS_TO_TICKS(120));
+    log_feedback_snapshot("WHEEL_AFTER_TORQUE_OFF", id, profile);
+}
+
+static esp_err_t write_goal_speed_only_for_profile(uint8_t id, motor_profile_t profile, uint16_t speed)
+{
+    const motor_profile_addrs_t *addrs = get_profile_addrs(profile);
+    if (!addrs) {
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    return scs_write_word(id, addrs->goal_speed_l, speed);
+}
+
+static void wheel_hold_probe(uint8_t id, motor_profile_t profile, uint16_t speed)
+{
+    const motor_profile_addrs_t *addrs = get_profile_addrs(profile);
+    uint16_t hold = 0;
+
+    ESP_LOGI(TAG, "===== WHEEL HOLD PROBE ID=%u speed=%u =====", id, speed);
+    if (!read_present_position(id, profile, &hold)) {
+        ESP_LOGW(TAG, "WHEEL HOLD ID=%u baseline pos read failed", id);
+        return;
+    }
+
+    ESP_LOGI(TAG, "WHEEL HOLD ID=%u hold=%u", id, hold);
+    ESP_LOGI(TAG, "WHEEL HOLD ID=%u torque on -> %s",
+             id, esp_err_to_name(scs_write_byte(id,
+                                                addrs ? addrs->torque_enable : SCS_ADDR_TORQUE_ENABLE,
+                                                1)));
+    vTaskDelay(pdMS_TO_TICKS(120));
+    ESP_LOGI(TAG, "WHEEL HOLD ID=%u write goal=%u speed=%u -> %s",
+             id, hold, speed,
+             esp_err_to_name(write_goal_for_profile(id, profile, (int16_t)hold, speed, 10)));
+    log_goal_latch("WHEEL_HOLD_LATCH", id, profile);
+    trace_motion("WHEEL_HOLD", id, profile, 10, 120);
+}
+
+static void wheel_speed_only_probe(uint8_t id, motor_profile_t profile, uint16_t speed)
+{
+    ESP_LOGI(TAG, "===== WHEEL SPEED-ONLY PROBE ID=%u speed=%u =====", id, speed);
+    ESP_LOGI(TAG, "WHEEL SPEED-ONLY ID=%u write speed=%u -> %s",
+             id, speed, esp_err_to_name(write_goal_speed_only_for_profile(id, profile, speed)));
+    log_goal_latch("WHEEL_SPEED_ONLY_LATCH", id, profile);
+    trace_motion("WHEEL_SPEED_ONLY", id, profile, 10, 120);
+}
+
+static void wheel_speed_only_probe_tagged(const char *tag, uint8_t id, motor_profile_t profile,
+                                          uint16_t speed, int samples, int interval_ms)
+{
+    ESP_LOGI(TAG, "===== %s ID=%u speed=%u =====", tag, id, speed);
+    ESP_LOGI(TAG, "%s ID=%u write speed=%u -> %s",
+             tag, id, speed, esp_err_to_name(write_goal_speed_only_for_profile(id, profile, speed)));
+    log_goal_latch("WHEEL_SPEED_TAG_LATCH", id, profile);
+    trace_motion(tag, id, profile, samples, interval_ms);
+}
+
+static void wheel_goal_speed_probe(uint8_t id, motor_profile_t profile, int delta, uint16_t speed)
+{
+    uint16_t base = 0;
+    uint16_t goal = 0;
+
+    ESP_LOGI(TAG, "===== WHEEL GOAL+SPEED PROBE ID=%u delta=%+d speed=%u =====",
+             id, delta, speed);
+    if (!read_present_position(id, profile, &base)) {
+        ESP_LOGW(TAG, "WHEEL GOAL+SPEED ID=%u baseline pos read failed", id);
+        return;
+    }
+
+    goal = clamp_goal_legacy_full((int)base + delta);
+    ESP_LOGI(TAG, "WHEEL GOAL+SPEED ID=%u base=%u goal=%u", id, base, goal);
+    ESP_LOGI(TAG, "WHEEL GOAL+SPEED ID=%u write goal=%u speed=%u -> %s",
+             id, goal, speed,
+             esp_err_to_name(write_goal_for_profile(id, profile, (int16_t)goal, speed, 10)));
+    log_goal_latch("WHEEL_GOAL_SPEED_LATCH", id, profile);
+    trace_motion("WHEEL_GOAL_SPEED", id, profile, 10, 120);
+}
+
+static void wheel_goal_direction_probe(uint8_t id, motor_profile_t profile, int delta, uint16_t speed)
+{
+    uint16_t base = 0;
+    uint16_t goal = 0;
+    int shortest = 0;
+
+    ESP_LOGI(TAG, "===== WHEEL GOAL-DIR PROBE ID=%u delta=%+d speed=%u =====",
+             id, delta, speed);
+    if (!read_present_position(id, profile, &base)) {
+        ESP_LOGW(TAG, "WHEEL GOAL-DIR ID=%u baseline pos read failed", id);
+        return;
+    }
+
+    goal = wrap_goal_legacy_mod1024(base, delta);
+    shortest = shortest_delta_mod1024(base, goal);
+    ESP_LOGI(TAG, "WHEEL GOAL-DIR ID=%u base=%u goal=%u shortest=%d",
+             id, base, goal, shortest);
+    ESP_LOGI(TAG, "WHEEL GOAL-DIR ID=%u write goal=%u speed=%u -> %s",
+             id, goal, speed,
+             esp_err_to_name(write_goal_for_profile(id, profile, (int16_t)goal, speed, 10)));
+    log_goal_latch("WHEEL_GOAL_DIR_LATCH", id, profile);
+    trace_motion("WHEEL_GOAL_DIR", id, profile, 8, 120);
+}
+
+static void wheel_direction_focus_probe(uint8_t id, motor_profile_t profile)
+{
+    const uint16_t speed_hold = 10;
+    const uint16_t speed_mid = 40;
+    const uint16_t speed_dirbit = 0x0400 | 40;
+
+    ESP_LOGI(TAG, "===== WHEEL DIRECTION FOCUS ID=%u =====", id);
+
+    wheel_hold_probe(id, profile, speed_hold);
+    vTaskDelay(pdMS_TO_TICKS(250));
+    wheel_goal_direction_probe(id, profile, +128, speed_mid);
+    vTaskDelay(pdMS_TO_TICKS(250));
+
+    wheel_hold_probe(id, profile, speed_hold);
+    vTaskDelay(pdMS_TO_TICKS(250));
+    wheel_goal_direction_probe(id, profile, -128, speed_mid);
+    vTaskDelay(pdMS_TO_TICKS(250));
+
+    wheel_hold_probe(id, profile, speed_hold);
+    vTaskDelay(pdMS_TO_TICKS(250));
+    wheel_speed_only_probe_tagged("WHEEL_SPEED_DIRBIT_FWD", id, profile, speed_mid, 8, 120);
+    vTaskDelay(pdMS_TO_TICKS(250));
+
+    wheel_hold_probe(id, profile, speed_hold);
+    vTaskDelay(pdMS_TO_TICKS(250));
+    wheel_speed_only_probe_tagged("WHEEL_SPEED_DIRBIT_REVBIT", id, profile, speed_dirbit, 8, 120);
+}
+
+static void wheel_speed_deadband_probe(uint8_t id, motor_profile_t profile)
+{
+    static const uint16_t speeds[] = { 0, 1, 5, 10, 15, 20, 25, 30, 40, 60 };
+
+    ESP_LOGI(TAG, "===== WHEEL SPEED DEADBAND ID=%u =====", id);
+    for (size_t i = 0; i < sizeof(speeds) / sizeof(speeds[0]); i++) {
+        wheel_hold_probe(id, profile, 10);
+        vTaskDelay(pdMS_TO_TICKS(220));
+        wheel_speed_only_probe_tagged("WHEEL_SPEED_SWEEP", id, profile, speeds[i], 6, 100);
+        vTaskDelay(pdMS_TO_TICKS(260));
+    }
+}
+
+static void wheel_stop_semantics_probe(uint8_t id, motor_profile_t profile)
+{
+    const motor_profile_addrs_t *addrs = get_profile_addrs(profile);
+    if (!addrs) {
+        ESP_LOGW(TAG, "WHEEL STOP ID=%u unknown profile", id);
+        return;
+    }
+
+    ESP_LOGI(TAG, "===== WHEEL STOP SEMANTICS ID=%u =====", id);
+
+    wheel_hold_probe(id, profile, 10);
+    vTaskDelay(pdMS_TO_TICKS(220));
+    wheel_speed_only_probe_tagged("WHEEL_STOP_PRE_SPEED0", id, profile, 40, 5, 100);
+    vTaskDelay(pdMS_TO_TICKS(180));
+    ESP_LOGI(TAG, "WHEEL STOP ID=%u write speed=0 -> %s",
+             id, esp_err_to_name(write_goal_speed_only_for_profile(id, profile, 0)));
+    log_goal_latch("WHEEL_STOP_SPEED0_LATCH", id, profile);
+    trace_motion("WHEEL_STOP_SPEED0", id, profile, 8, 100);
+
+    wheel_hold_probe(id, profile, 10);
+    vTaskDelay(pdMS_TO_TICKS(220));
+    wheel_speed_only_probe_tagged("WHEEL_STOP_PRE_TORQUE_OFF", id, profile, 40, 5, 100);
+    vTaskDelay(pdMS_TO_TICKS(180));
+    ESP_LOGI(TAG, "WHEEL STOP ID=%u torque off -> %s",
+             id, esp_err_to_name(scs_write_byte(id, addrs->torque_enable, 0)));
+    log_goal_latch("WHEEL_STOP_TORQUE_OFF_LATCH", id, profile);
+    trace_motion("WHEEL_STOP_TORQUE_OFF", id, profile, 8, 100);
+
+    ESP_LOGI(TAG, "WHEEL STOP ID=%u torque on -> %s",
+             id, esp_err_to_name(scs_write_byte(id, addrs->torque_enable, 1)));
+    vTaskDelay(pdMS_TO_TICKS(120));
+    wheel_hold_probe(id, profile, 10);
+}
+
+static void wheel_drive_semantics_probe(uint8_t id, motor_profile_t profile)
+{
+    const motor_profile_addrs_t *addrs = get_profile_addrs(profile);
+    static const uint16_t speeds[] = { 10, 40, 100 };
+
+    ESP_LOGI(TAG, "===== WHEEL DRIVE SEMANTICS ID=%u =====", id);
+    if (!addrs) {
+        ESP_LOGW(TAG, "WHEEL DRIVE ID=%u unknown profile", id);
+        return;
+    }
+
+    ESP_LOGI(TAG, "WHEEL DRIVE ID=%u torque on -> %s",
+             id, esp_err_to_name(scs_write_byte(id, addrs->torque_enable, 1)));
+    vTaskDelay(pdMS_TO_TICKS(150));
+    log_feedback_snapshot("WHEEL_DRIVE_BASE", id, profile);
+
+    wheel_hold_probe(id, profile, speeds[0]);
+    vTaskDelay(pdMS_TO_TICKS(250));
+
+    for (int i = 0; i < (int)(sizeof(speeds) / sizeof(speeds[0])); i++) {
+        wheel_speed_only_probe(id, profile, speeds[i]);
+        vTaskDelay(pdMS_TO_TICKS(250));
+    }
+
+    for (int i = 0; i < (int)(sizeof(speeds) / sizeof(speeds[0])); i++) {
+        wheel_goal_speed_probe(id, profile, +8, speeds[i]);
+        vTaskDelay(pdMS_TO_TICKS(250));
+    }
+
+    wheel_goal_speed_probe(id, profile, -8, speeds[1]);
+    vTaskDelay(pdMS_TO_TICKS(250));
+
+    ESP_LOGI(TAG, "WHEEL DRIVE ID=%u torque off -> %s",
+             id, esp_err_to_name(scs_write_byte(id, addrs->torque_enable, 0)));
+    vTaskDelay(pdMS_TO_TICKS(120));
+    log_feedback_snapshot("WHEEL_DRIVE_AFTER_TORQUE_OFF", id, profile);
 }
 
 // ============================================================
@@ -1802,6 +2232,325 @@ void motor_explore_task(void *arg)
 
     ESP_LOGI(TAG, "======================================");
     ESP_LOGI(TAG, "  Motor low-risk exploration COMPLETE");
+    ESP_LOGI(TAG, "======================================");
+    vTaskDelete(NULL);
+}
+
+void motor_identify_four_nodes_task(void *arg)
+{
+    (void)arg;
+
+    ESP_LOGI(TAG, "======================================");
+    ESP_LOGI(TAG, "  Motor four-node identify task");
+    ESP_LOGI(TAG, "  IDs: 11, 12, 21, 22");
+    ESP_LOGI(TAG, "  Policy: servo safe-open first, then read-only identify");
+    ESP_LOGI(TAG, "======================================");
+
+    esp_err_t err = motor_init();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "motor_init failed: %s", esp_err_to_name(err));
+        vTaskDelete(NULL);
+        return;
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(1200));
+    move_servo_pair_to_safe_open_20();
+    vTaskDelay(pdMS_TO_TICKS(400));
+
+    for (int i = 0; i < IDENTIFY_COUNT; i++) {
+        uint8_t id = IDENTIFY_IDS[i];
+        scs_status_t st = {0};
+        motor_profile_t profile = MOTOR_PROFILE_UNKNOWN;
+
+        ESP_LOGI(TAG, "===== IDENTIFY NODE ID=%u =====", id);
+        err = scs_ping(id, &st);
+        if (err == ESP_OK) {
+            print_status("IDENTIFY_PING", id, &st);
+        } else {
+            ESP_LOGW(TAG, "IDENTIFY_PING ID=%u failed: %s", id, esp_err_to_name(err));
+            continue;
+        }
+
+        profile = step_register_scan(id);
+        vTaskDelay(pdMS_TO_TICKS(200));
+        step_read_multi_with_profile(id, profile);
+        vTaskDelay(pdMS_TO_TICKS(120));
+        log_read_u8(id, 33, "Mode");
+        log_read_u16(id, 69, "CurrentLike");
+        vTaskDelay(pdMS_TO_TICKS(250));
+    }
+
+    ESP_LOGI(TAG, "======================================");
+    ESP_LOGI(TAG, "  Motor four-node identify COMPLETE");
+    ESP_LOGI(TAG, "======================================");
+    vTaskDelete(NULL);
+}
+
+void motor_probe_wheels_task(void *arg)
+{
+    (void)arg;
+
+    ESP_LOGI(TAG, "======================================");
+    ESP_LOGI(TAG, "  Motor wheel probe task");
+    ESP_LOGI(TAG, "  Safety: open 12/22 to 20%% first");
+    ESP_LOGI(TAG, "  Targets: 11, 21");
+    ESP_LOGI(TAG, "======================================");
+
+    esp_err_t err = motor_init();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "motor_init failed: %s", esp_err_to_name(err));
+        vTaskDelete(NULL);
+        return;
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(1200));
+    move_servo_pair_to_safe_open_20();
+    vTaskDelay(pdMS_TO_TICKS(400));
+
+    for (int i = 0; i < WHEEL_COUNT; i++) {
+        uint8_t id = WHEEL_IDS[i];
+        scs_status_t st = {0};
+        motor_profile_t profile = MOTOR_PROFILE_UNKNOWN;
+
+        ESP_LOGI(TAG, "===== WHEEL IDENTIFY ID=%u =====", id);
+        err = scs_ping(id, &st);
+        if (err == ESP_OK) {
+            print_status("WHEEL_PING", id, &st);
+        } else {
+            ESP_LOGW(TAG, "WHEEL_PING ID=%u failed: %s", id, esp_err_to_name(err));
+            continue;
+        }
+
+        profile = step_register_scan(id);
+        vTaskDelay(pdMS_TO_TICKS(150));
+        step_read_multi_with_profile(id, profile);
+        vTaskDelay(pdMS_TO_TICKS(150));
+        wheel_torque_probe(id, profile);
+        vTaskDelay(pdMS_TO_TICKS(200));
+        wheel_position_probe(id, profile, +16);
+        vTaskDelay(pdMS_TO_TICKS(250));
+        wheel_position_probe(id, profile, -16);
+        vTaskDelay(pdMS_TO_TICKS(300));
+    }
+
+    ESP_LOGI(TAG, "======================================");
+    ESP_LOGI(TAG, "  Motor wheel probe COMPLETE");
+    ESP_LOGI(TAG, "======================================");
+    vTaskDelete(NULL);
+}
+
+void motor_probe_wheel_drive_task(void *arg)
+{
+    (void)arg;
+
+    ESP_LOGI(TAG, "======================================");
+    ESP_LOGI(TAG, "  Motor wheel drive semantics task");
+    ESP_LOGI(TAG, "  Safety: open 12/22 to 20%% first");
+    ESP_LOGI(TAG, "  Targets: 11, 21");
+    ESP_LOGI(TAG, "  Experiments: hold / speed-only / goal+speed");
+    ESP_LOGI(TAG, "======================================");
+
+    esp_err_t err = motor_init();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "motor_init failed: %s", esp_err_to_name(err));
+        vTaskDelete(NULL);
+        return;
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(1200));
+    move_servo_pair_to_safe_open_20();
+    vTaskDelay(pdMS_TO_TICKS(500));
+
+    for (int i = 0; i < WHEEL_COUNT; i++) {
+        uint8_t id = WHEEL_IDS[i];
+        scs_status_t st = {0};
+        motor_profile_t profile = MOTOR_PROFILE_UNKNOWN;
+
+        ESP_LOGI(TAG, "===== WHEEL DRIVE IDENTIFY ID=%u =====", id);
+        err = scs_ping(id, &st);
+        if (err == ESP_OK) {
+            print_status("WHEEL_DRIVE_PING", id, &st);
+        } else {
+            ESP_LOGW(TAG, "WHEEL_DRIVE_PING ID=%u failed: %s", id, esp_err_to_name(err));
+            continue;
+        }
+
+        profile = step_register_scan(id);
+        vTaskDelay(pdMS_TO_TICKS(150));
+        step_read_multi_with_profile(id, profile);
+        vTaskDelay(pdMS_TO_TICKS(200));
+        wheel_drive_semantics_probe(id, profile);
+        vTaskDelay(pdMS_TO_TICKS(400));
+    }
+
+    ESP_LOGI(TAG, "======================================");
+    ESP_LOGI(TAG, "  Motor wheel drive semantics COMPLETE");
+    ESP_LOGI(TAG, "======================================");
+    vTaskDelete(NULL);
+}
+
+void motor_probe_wheel_direction_task(void *arg)
+{
+    (void)arg;
+
+    ESP_LOGI(TAG, "======================================");
+    ESP_LOGI(TAG, "  Motor wheel direction semantics task");
+    ESP_LOGI(TAG, "  Safety: open 12/22 to 20%% first");
+    ESP_LOGI(TAG, "  Targets: 11, 21");
+    ESP_LOGI(TAG, "  Experiments: goal +/-128 / speed dir bit");
+    ESP_LOGI(TAG, "======================================");
+
+    esp_err_t err = motor_init();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "motor_init failed: %s", esp_err_to_name(err));
+        vTaskDelete(NULL);
+        return;
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(1200));
+    move_servo_pair_to_safe_open_20();
+    vTaskDelay(pdMS_TO_TICKS(500));
+
+    for (int i = 0; i < WHEEL_COUNT; i++) {
+        uint8_t id = WHEEL_IDS[i];
+        scs_status_t st = {0};
+        motor_profile_t profile = MOTOR_PROFILE_UNKNOWN;
+
+        ESP_LOGI(TAG, "===== WHEEL DIRECTION IDENTIFY ID=%u =====", id);
+        err = scs_ping(id, &st);
+        if (err == ESP_OK) {
+            print_status("WHEEL_DIRECTION_PING", id, &st);
+        } else {
+            ESP_LOGW(TAG, "WHEEL_DIRECTION_PING ID=%u failed: %s", id, esp_err_to_name(err));
+            continue;
+        }
+
+        profile = step_register_scan(id);
+        vTaskDelay(pdMS_TO_TICKS(150));
+        step_read_multi_with_profile(id, profile);
+        vTaskDelay(pdMS_TO_TICKS(200));
+        wheel_direction_focus_probe(id, profile);
+        vTaskDelay(pdMS_TO_TICKS(500));
+
+        {
+            const motor_profile_addrs_t *addrs = get_profile_addrs(profile);
+            if (addrs) {
+                ESP_LOGI(TAG, "WHEEL DIRECTION ID=%u torque off -> %s",
+                         id, esp_err_to_name(scs_write_byte(id, addrs->torque_enable, 0)));
+                vTaskDelay(pdMS_TO_TICKS(120));
+                log_feedback_snapshot("WHEEL_DIRECTION_AFTER_TORQUE_OFF", id, profile);
+            }
+        }
+    }
+
+    ESP_LOGI(TAG, "======================================");
+    ESP_LOGI(TAG, "  Motor wheel direction semantics COMPLETE");
+    ESP_LOGI(TAG, "======================================");
+    vTaskDelete(NULL);
+}
+
+void motor_probe_wheel_control_task(void *arg)
+{
+    (void)arg;
+
+    ESP_LOGI(TAG, "======================================");
+    ESP_LOGI(TAG, "  Motor wheel control semantics task");
+    ESP_LOGI(TAG, "  Safety: open 12/22 to 20%% first");
+    ESP_LOGI(TAG, "  Targets: 11, 21");
+    ESP_LOGI(TAG, "  Experiments: speed deadband / stop semantics");
+    ESP_LOGI(TAG, "======================================");
+
+    esp_err_t err = motor_init();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "motor_init failed: %s", esp_err_to_name(err));
+        vTaskDelete(NULL);
+        return;
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(1200));
+    move_servo_pair_to_safe_open_20();
+    vTaskDelay(pdMS_TO_TICKS(500));
+
+    for (int i = 0; i < WHEEL_COUNT; i++) {
+        uint8_t id = WHEEL_IDS[i];
+        scs_status_t st = {0};
+        motor_profile_t profile = MOTOR_PROFILE_UNKNOWN;
+
+        ESP_LOGI(TAG, "===== WHEEL CONTROL IDENTIFY ID=%u =====", id);
+        err = scs_ping(id, &st);
+        if (err == ESP_OK) {
+            print_status("WHEEL_CONTROL_PING", id, &st);
+        } else {
+            ESP_LOGW(TAG, "WHEEL_CONTROL_PING ID=%u failed: %s", id, esp_err_to_name(err));
+            continue;
+        }
+
+        profile = step_register_scan(id);
+        vTaskDelay(pdMS_TO_TICKS(150));
+        step_read_multi_with_profile(id, profile);
+        vTaskDelay(pdMS_TO_TICKS(220));
+        wheel_speed_deadband_probe(id, profile);
+        vTaskDelay(pdMS_TO_TICKS(400));
+        wheel_stop_semantics_probe(id, profile);
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+
+    ESP_LOGI(TAG, "======================================");
+    ESP_LOGI(TAG, "  Motor wheel control semantics COMPLETE");
+    ESP_LOGI(TAG, "======================================");
+    vTaskDelete(NULL);
+}
+
+void motor_probe_wheel_midrange_task(void *arg)
+{
+    static const uint16_t speeds[] = { 20, 25, 30, 40 };
+    const uint8_t id = 21;
+
+    (void)arg;
+
+    ESP_LOGI(TAG, "======================================");
+    ESP_LOGI(TAG, "  Motor wheel midrange follow-up task");
+    ESP_LOGI(TAG, "  Safety: open 12/22 to 20%% first");
+    ESP_LOGI(TAG, "  Target: 21");
+    ESP_LOGI(TAG, "  Experiments: speed 20 / 25 / 30 / 40");
+    ESP_LOGI(TAG, "======================================");
+
+    esp_err_t err = motor_init();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "motor_init failed: %s", esp_err_to_name(err));
+        vTaskDelete(NULL);
+        return;
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(1200));
+    move_servo_pair_to_safe_open_20();
+    vTaskDelay(pdMS_TO_TICKS(500));
+
+    scs_status_t st = {0};
+    motor_profile_t profile = MOTOR_PROFILE_UNKNOWN;
+    err = scs_ping(id, &st);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "WHEEL_MIDRANGE_PING ID=%u failed: %s", id, esp_err_to_name(err));
+        vTaskDelete(NULL);
+        return;
+    }
+
+    print_status("WHEEL_MIDRANGE_PING", id, &st);
+    profile = step_register_scan(id);
+    vTaskDelay(pdMS_TO_TICKS(150));
+    step_read_multi_with_profile(id, profile);
+    vTaskDelay(pdMS_TO_TICKS(220));
+
+    for (size_t i = 0; i < sizeof(speeds) / sizeof(speeds[0]); i++) {
+        wheel_hold_probe(id, profile, 10);
+        vTaskDelay(pdMS_TO_TICKS(220));
+        wheel_speed_only_probe_tagged("WHEEL_MIDRANGE_SWEEP", id, profile, speeds[i], 6, 100);
+        vTaskDelay(pdMS_TO_TICKS(260));
+    }
+
+    wheel_hold_probe(id, profile, 10);
+    ESP_LOGI(TAG, "======================================");
+    ESP_LOGI(TAG, "  Motor wheel midrange follow-up COMPLETE");
     ESP_LOGI(TAG, "======================================");
     vTaskDelete(NULL);
 }

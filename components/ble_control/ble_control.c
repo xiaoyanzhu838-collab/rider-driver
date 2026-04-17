@@ -8,6 +8,7 @@
 #include "esp_check.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
 #include "freertos/task.h"
 #include "host/ble_gatt.h"
 #include "host/ble_hs.h"
@@ -27,9 +28,14 @@ static const char *TAG = "ble_control";
 
 #define MOTOR_ID_12 12
 #define MOTOR_ID_22 22
+#define MOTOR_ID_11 11
+#define MOTOR_ID_21 21
 #define MOTOR_12_SAFE_DELTA 104
 #define MOTOR_22_SAFE_DELTA 112
 #define DEFAULT_MOVE_SPEED 200
+#define WHEEL_SAFE_OPEN_PERCENT 20
+#define WHEEL_HOLD_SPEED 10
+#define WHEEL_MAX_GOAL_SPEED 1064
 
 static uint8_t s_own_addr_type;
 static bool s_ble_started = false;
@@ -38,6 +44,7 @@ static char s_status_text[BLE_MAX_TEXT_LEN] = "ready";
 static char s_last_command[BLE_MAX_TEXT_LEN] = "";
 static int s_home12 = 599;
 static int s_home22 = 439;
+static QueueHandle_t s_command_queue;
 
 static const ble_uuid128_t s_service_uuid =
     BLE_UUID128_INIT(0x10, 0x32, 0x54, 0x76, 0x98, 0xba, 0xdc, 0xfe,
@@ -50,6 +57,14 @@ static const ble_uuid128_t s_status_uuid =
                      0x10, 0x32, 0x54, 0x76, 0x98, 0xba, 0xdc, 0xfe);
 
 static bool ble_control_advertise(void);
+static void status_scan_ids(int start_id, int end_id);
+
+typedef enum {
+    WHEEL_MODE_ABS = 0,
+    WHEEL_MODE_RAW = 1,
+    WHEEL_MODE_I16 = 2,
+    WHEEL_MODE_DXL = 3,
+} wheel_write_mode_t;
 
 typedef struct {
     uint16_t model;
@@ -74,6 +89,10 @@ typedef struct {
     uint16_t torque_limit;
     uint8_t lock;
 } servo_config_t;
+
+typedef struct {
+    char text[BLE_MAX_TEXT_LEN];
+} ble_command_item_t;
 
 static void status_set(const char *fmt, ...)
 {
@@ -102,6 +121,16 @@ static int gatt_write_text(struct os_mbuf *om, char *dst, uint16_t max_len)
 static bool is_supported_servo(uint8_t id)
 {
     return id == MOTOR_ID_12 || id == MOTOR_ID_22;
+}
+
+static bool is_supported_wheel(uint8_t id)
+{
+    return id == MOTOR_ID_11 || id == MOTOR_ID_21;
+}
+
+static bool is_supported_node(uint8_t id)
+{
+    return is_supported_servo(id) || is_supported_wheel(id);
 }
 
 static int servo_home(uint8_t id)
@@ -183,6 +212,157 @@ static int clamp_torque_limit(int value)
     return value;
 }
 
+static int clamp_wheel_goal_speed(int value)
+{
+    if (value < 0) {
+        return 0;
+    }
+    if (value > WHEEL_MAX_GOAL_SPEED) {
+        return WHEEL_MAX_GOAL_SPEED;
+    }
+    return value;
+}
+
+static int clamp_i16_range(int value)
+{
+    if (value < -32768) {
+        return -32768;
+    }
+    if (value > 32767) {
+        return 32767;
+    }
+    return value;
+}
+
+static int clamp_u16_range(int value)
+{
+    if (value < 0) {
+        return 0;
+    }
+    if (value > 65535) {
+        return 65535;
+    }
+    return value;
+}
+
+static int clamp_probe_samples(int value)
+{
+    if (value < 2) {
+        return 2;
+    }
+    if (value > 40) {
+        return 40;
+    }
+    return value;
+}
+
+static int clamp_probe_interval_ms(int value)
+{
+    if (value < 20) {
+        return 20;
+    }
+    if (value > 500) {
+        return 500;
+    }
+    return value;
+}
+
+static int clamp_probe_settle_ms(int value)
+{
+    if (value < 0) {
+        return 0;
+    }
+    if (value > 1000) {
+        return 1000;
+    }
+    return value;
+}
+
+static const char *wheel_mode_name(wheel_write_mode_t mode)
+{
+    switch (mode) {
+    case WHEEL_MODE_ABS:
+        return "ABS";
+    case WHEEL_MODE_RAW:
+        return "RAW";
+    case WHEEL_MODE_I16:
+        return "I16";
+    case WHEEL_MODE_DXL:
+        return "DXL";
+    default:
+        return "UNK";
+    }
+}
+
+static bool parse_wheel_mode(const char *text, wheel_write_mode_t *mode_out)
+{
+    if (!text || !mode_out) {
+        return false;
+    }
+
+    if (strcmp(text, "ABS") == 0) {
+        *mode_out = WHEEL_MODE_ABS;
+        return true;
+    }
+    if (strcmp(text, "RAW") == 0) {
+        *mode_out = WHEEL_MODE_RAW;
+        return true;
+    }
+    if (strcmp(text, "I16") == 0) {
+        *mode_out = WHEEL_MODE_I16;
+        return true;
+    }
+    if (strcmp(text, "DXL") == 0) {
+        *mode_out = WHEEL_MODE_DXL;
+        return true;
+    }
+    return false;
+}
+
+static uint16_t encode_wheel_signed_i16(int value)
+{
+    return (uint16_t)(int16_t)clamp_i16_range(value);
+}
+
+static uint16_t encode_wheel_dxl_signed(int value)
+{
+    int magnitude = value < 0 ? -value : value;
+    if (magnitude > 1023) {
+        magnitude = 1023;
+    }
+    if (value < 0) {
+        return (uint16_t)(0x0400 | magnitude);
+    }
+    return (uint16_t)magnitude;
+}
+
+static uint16_t encode_wheel_goal_value(wheel_write_mode_t mode, int value)
+{
+    switch (mode) {
+    case WHEEL_MODE_ABS:
+        return (uint16_t)clamp_wheel_goal_speed(value);
+    case WHEEL_MODE_RAW:
+        return (uint16_t)clamp_u16_range(value);
+    case WHEEL_MODE_I16:
+        return encode_wheel_signed_i16(value);
+    case WHEEL_MODE_DXL:
+        return encode_wheel_dxl_signed(value);
+    default:
+        return 0;
+    }
+}
+
+static int wheel_step_delta(uint16_t prev, uint16_t curr)
+{
+    int delta = (int)curr - (int)prev;
+    if (delta > 512) {
+        delta -= 1024;
+    } else if (delta < -512) {
+        delta += 1024;
+    }
+    return delta;
+}
+
 static int pair_goal_for_percent(uint8_t id, int percent)
 {
     percent = clamp_percent(percent);
@@ -232,10 +412,55 @@ static bool read_servo_config(uint8_t id, servo_config_t *out)
            scs_read_byte(id, 0x2F, &out->lock) == ESP_OK;
 }
 
+static void status_scan_ids(int start_id, int end_id)
+{
+    char ids_text[256] = {0};
+    size_t used = 0;
+    int count = 0;
+
+    if (start_id < 1) {
+        start_id = 1;
+    }
+    if (end_id > 253) {
+        end_id = 253;
+    }
+    if (start_id > end_id) {
+        int tmp = start_id;
+        start_id = end_id;
+        end_id = tmp;
+    }
+
+    if (motor_init() != ESP_OK) {
+        status_set("ERR SCAN motor_init_failed");
+        return;
+    }
+
+    ESP_LOGI(TAG, "starting UART2 bus scan: ids %d..%d", start_id, end_id);
+
+    for (int id = start_id; id <= end_id; id++) {
+        scs_status_t st = {0};
+        if (scs_ping((uint8_t)id, &st) == ESP_OK) {
+            int written = snprintf(ids_text + used, sizeof(ids_text) - used,
+                                   "%s%d", count == 0 ? "" : ",", id);
+            if (written > 0 && (size_t)written < (sizeof(ids_text) - used)) {
+                used += (size_t)written;
+            }
+            count++;
+            ESP_LOGI(TAG, "SCAN hit: id=%d error=0x%02X params=%u",
+                     id, st.error, st.param_count);
+        }
+        vTaskDelay(pdMS_TO_TICKS(8));
+    }
+
+    status_set(
+        "{\"kind\":\"scan\",\"start\":%d,\"end\":%d,\"count\":%d,\"ids\":[%s]}",
+        start_id, end_id, count, ids_text);
+}
+
 static void status_config(uint8_t id)
 {
     servo_config_t cfg = {0};
-    if (!is_supported_servo(id)) {
+    if (!is_supported_node(id)) {
         status_set("ERR CFG id=%u unsupported", id);
         return;
     }
@@ -255,6 +480,38 @@ static void status_config(uint8_t id)
         cfg.max_voltage_raw, cfg.max_torque, cfg.status_return_level,
         cfg.alarm_led, cfg.shutdown, cfg.led, cfg.cw_margin, cfg.ccw_margin,
         cfg.cw_slope, cfg.ccw_slope, cfg.torque_limit, cfg.lock);
+}
+
+static void status_wheel_snapshot(void)
+{
+    motor_feedback_t fb11 = {0};
+    motor_feedback_t fb21 = {0};
+    uint16_t goal11 = 0;
+    uint16_t goal21 = 0;
+    uint16_t goal_speed11 = 0;
+    uint16_t goal_speed21 = 0;
+    uint8_t torque11 = 0;
+    uint8_t torque21 = 0;
+
+    bool ok11 = motor_read_feedback(MOTOR_ID_11, &fb11) == ESP_OK &&
+                read_goal_and_torque(MOTOR_ID_11, &goal11, &torque11) &&
+                scs_read_word(MOTOR_ID_11, SCS_ADDR_GOAL_SPEED_L, &goal_speed11) == ESP_OK;
+    bool ok21 = motor_read_feedback(MOTOR_ID_21, &fb21) == ESP_OK &&
+                read_goal_and_torque(MOTOR_ID_21, &goal21, &torque21) &&
+                scs_read_word(MOTOR_ID_21, SCS_ADDR_GOAL_SPEED_L, &goal_speed21) == ESP_OK;
+
+    if (!ok11 || !ok21) {
+        status_set("ERR WSNAP ok11=%d ok21=%d", ok11 ? 1 : 0, ok21 ? 1 : 0);
+        return;
+    }
+
+    status_set(
+        "{\"kind\":\"wheel\",\"safe\":%d,"
+        "\"p11\":%u,\"g11\":%u,\"t11\":%u,\"gs11\":%u,\"s11\":%u,\"l11\":%u,\"v11\":%u,\"tmp11\":%u,\"m11\":%u,"
+        "\"p21\":%u,\"g21\":%u,\"t21\":%u,\"gs21\":%u,\"s21\":%u,\"l21\":%u,\"v21\":%u,\"tmp21\":%u,\"m21\":%u}",
+        WHEEL_SAFE_OPEN_PERCENT,
+        fb11.position, goal11, torque11, goal_speed11, fb11.speed, fb11.load, fb11.voltage, fb11.temperature, fb11.moving,
+        fb21.position, goal21, torque21, goal_speed21, fb21.speed, fb21.load, fb21.voltage, fb21.temperature, fb21.moving);
 }
 
 static void status_snapshot(void)
@@ -381,9 +638,164 @@ static esp_err_t restore_known_runtime_defaults(uint8_t id)
     return set_compliance(id, 1, 1, 32, 32);
 }
 
+static esp_err_t ensure_wheel_safe_open(void)
+{
+    return set_pair_percent(WHEEL_SAFE_OPEN_PERCENT, DEFAULT_MOVE_SPEED);
+}
+
+static esp_err_t wheel_set_speed(uint8_t id, int speed)
+{
+    if (!is_supported_wheel(id)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    ESP_RETURN_ON_ERROR(ensure_wheel_safe_open(), TAG, "safe open failed");
+    ESP_RETURN_ON_ERROR(motor_set_torque(id, true), TAG, "wheel torque on failed");
+    return scs_write_word(id, SCS_ADDR_GOAL_SPEED_L, (uint16_t)clamp_wheel_goal_speed(speed));
+}
+
+static esp_err_t wheel_set_encoded(uint8_t id, wheel_write_mode_t mode, int value, uint16_t *raw_out)
+{
+    uint16_t raw = encode_wheel_goal_value(mode, value);
+
+    if (!is_supported_wheel(id)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    ESP_RETURN_ON_ERROR(ensure_wheel_safe_open(), TAG, "safe open failed");
+    ESP_RETURN_ON_ERROR(motor_set_torque(id, true), TAG, "wheel torque on failed");
+    ESP_RETURN_ON_ERROR(scs_write_word(id, SCS_ADDR_GOAL_SPEED_L, raw), TAG, "wheel raw speed write failed");
+    if (raw_out) {
+        *raw_out = raw;
+    }
+    return ESP_OK;
+}
+
+static esp_err_t wheel_hold_current(uint8_t id)
+{
+    motor_feedback_t fb = {0};
+
+    if (!is_supported_wheel(id)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    ESP_RETURN_ON_ERROR(ensure_wheel_safe_open(), TAG, "safe open failed");
+    ESP_RETURN_ON_ERROR(motor_read_feedback(id, &fb), TAG, "wheel read failed");
+    ESP_RETURN_ON_ERROR(motor_set_torque(id, true), TAG, "wheel torque on failed");
+    ESP_RETURN_ON_ERROR(scs_write_word(id, SCS_ADDR_GOAL_POSITION_L, fb.position), TAG, "wheel goal write failed");
+    return scs_write_word(id, SCS_ADDR_GOAL_SPEED_L, WHEEL_HOLD_SPEED);
+}
+
+static esp_err_t wheel_stop(uint8_t id)
+{
+    if (!is_supported_wheel(id)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    ESP_RETURN_ON_ERROR(ensure_wheel_safe_open(), TAG, "safe open failed");
+    ESP_RETURN_ON_ERROR(motor_set_torque(id, true), TAG, "wheel torque on failed");
+    return scs_write_word(id, SCS_ADDR_GOAL_SPEED_L, 0);
+}
+
+static esp_err_t wheel_relax(uint8_t id)
+{
+    if (!is_supported_wheel(id)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    ESP_RETURN_ON_ERROR(ensure_wheel_safe_open(), TAG, "safe open failed");
+    return motor_set_torque(id, false);
+}
+
+static void status_wheel_probe(wheel_write_mode_t mode, uint8_t id, int value,
+                               int settle_ms, int samples, int interval_ms)
+{
+    motor_feedback_t start = {0};
+    motor_feedback_t fb = {0};
+    motor_feedback_t stop_fb = {0};
+    uint16_t raw = 0;
+    int sum_delta = 0;
+    int sum_abs_delta = 0;
+    int pos_steps = 0;
+    int neg_steps = 0;
+    int max_speed = 0;
+    int last_delta = 0;
+    bool stop_ok = false;
+
+    settle_ms = clamp_probe_settle_ms(settle_ms);
+    samples = clamp_probe_samples(samples);
+    interval_ms = clamp_probe_interval_ms(interval_ms);
+
+    if (!is_supported_wheel(id)) {
+        status_set("ERR WPROBE id=%u unsupported", id);
+        return;
+    }
+
+    if (motor_read_feedback(id, &start) != ESP_OK) {
+        status_set("ERR WPROBE id=%u start_read_failed", id);
+        return;
+    }
+
+    esp_err_t err = wheel_set_encoded(id, mode, value, &raw);
+    if (err != ESP_OK) {
+        status_set("ERR WPROBE id=%u %s", id, esp_err_to_name(err));
+        return;
+    }
+
+    if (settle_ms > 0) {
+        vTaskDelay(pdMS_TO_TICKS(settle_ms));
+    }
+
+    uint16_t prev_pos = start.position;
+    for (int i = 0; i < samples; i++) {
+        if (motor_read_feedback(id, &fb) != ESP_OK) {
+            status_set("ERR WPROBE id=%u sample_failed idx=%d", id, i);
+            (void)wheel_stop(id);
+            return;
+        }
+
+        last_delta = wheel_step_delta(prev_pos, fb.position);
+        sum_delta += last_delta;
+        sum_abs_delta += last_delta < 0 ? -last_delta : last_delta;
+        if (last_delta > 0) {
+            pos_steps++;
+        } else if (last_delta < 0) {
+            neg_steps++;
+        }
+        if ((int)fb.speed > max_speed) {
+            max_speed = fb.speed;
+        }
+
+        prev_pos = fb.position;
+        if (i + 1 < samples) {
+            vTaskDelay(pdMS_TO_TICKS(interval_ms));
+        }
+    }
+
+    stop_ok = wheel_stop(id) == ESP_OK;
+    if (stop_ok) {
+        vTaskDelay(pdMS_TO_TICKS(80));
+        (void)motor_read_feedback(id, &stop_fb);
+    }
+
+    status_set(
+        "{\"kind\":\"wprobe\",\"mode\":\"%s\",\"id\":%u,\"input\":%d,\"raw\":%u,"
+        "\"settle\":%d,\"samples\":%d,\"dt\":%d,"
+        "\"start_p\":%u,\"end_p\":%u,\"sum\":%d,\"sum_abs\":%d,"
+        "\"pos\":%d,\"neg\":%d,\"last\":%d,\"max_s\":%d,"
+        "\"last_s\":%u,\"last_l\":%u,\"last_m\":%u,"
+        "\"stop_ok\":%d,\"stop_p\":%u,\"stop_s\":%u}",
+        wheel_mode_name(mode), id, value, raw,
+        settle_ms, samples, interval_ms,
+        start.position, fb.position, sum_delta, sum_abs_delta,
+        pos_steps, neg_steps, last_delta, max_speed,
+        fb.speed, fb.load, fb.moving,
+        stop_ok ? 1 : 0, stop_fb.position, stop_fb.speed);
+}
+
 static void execute_command(const char *cmd)
 {
     char op[24] = {0};
+    char mode_text[24] = {0};
     int id = 0;
     int a = 0;
     int b = 0;
@@ -404,12 +816,25 @@ static void execute_command(const char *cmd)
     }
 
     if (strcmp(op, "HELP") == 0) {
-        status_set("OK cmds: GET CFG LED TL COMP RESTORE_RUNTIME PAIR HOME EDGE SET TORQUE RELAX CAPTURE_HOME PING");
+        status_set("OK cmds: GET WGET SCAN CFG LED TL COMP RESTORE_RUNTIME PAIR HOME EDGE SET TORQUE RELAX CAPTURE_HOME WSET WRAW WI16 WDXL WPROBE WSTOP WHOLD WRELAX PING");
         return;
     }
 
     if (strcmp(op, "GET") == 0 || strcmp(op, "READ") == 0) {
         status_snapshot();
+        return;
+    }
+
+    if (strcmp(op, "WGET") == 0) {
+        status_wheel_snapshot();
+        return;
+    }
+
+    if (strcmp(op, "SCAN") == 0) {
+        int start_id = 1;
+        int end_id = 253;
+        (void)sscanf(cmd, "%23s %d %d", op, &start_id, &end_id);
+        status_scan_ids(start_id, end_id);
         return;
     }
 
@@ -539,7 +964,116 @@ static void execute_command(const char *cmd)
         return;
     }
 
+    if (strcmp(op, "WSET") == 0 && sscanf(cmd, "%23s %d %d", op, &id, &a) == 3) {
+        esp_err_t err = wheel_set_speed((uint8_t)id, a);
+        if (err == ESP_OK) {
+            status_wheel_snapshot();
+        } else {
+            status_set("ERR WSET id=%d %s", id, esp_err_to_name(err));
+        }
+        return;
+    }
+
+    if (strcmp(op, "WRAW") == 0 && sscanf(cmd, "%23s %d %d", op, &id, &a) == 3) {
+        uint16_t raw = 0;
+        esp_err_t err = wheel_set_encoded((uint8_t)id, WHEEL_MODE_RAW, a, &raw);
+        if (err == ESP_OK) {
+            status_set("{\"kind\":\"wheel_write\",\"mode\":\"RAW\",\"id\":%d,\"input\":%d,\"raw\":%u}", id, a, raw);
+        } else {
+            status_set("ERR WRAW id=%d %s", id, esp_err_to_name(err));
+        }
+        return;
+    }
+
+    if (strcmp(op, "WI16") == 0 && sscanf(cmd, "%23s %d %d", op, &id, &a) == 3) {
+        uint16_t raw = 0;
+        esp_err_t err = wheel_set_encoded((uint8_t)id, WHEEL_MODE_I16, a, &raw);
+        if (err == ESP_OK) {
+            status_set("{\"kind\":\"wheel_write\",\"mode\":\"I16\",\"id\":%d,\"input\":%d,\"raw\":%u}", id, a, raw);
+        } else {
+            status_set("ERR WI16 id=%d %s", id, esp_err_to_name(err));
+        }
+        return;
+    }
+
+    if (strcmp(op, "WDXL") == 0 && sscanf(cmd, "%23s %d %d", op, &id, &a) == 3) {
+        uint16_t raw = 0;
+        esp_err_t err = wheel_set_encoded((uint8_t)id, WHEEL_MODE_DXL, a, &raw);
+        if (err == ESP_OK) {
+            status_set("{\"kind\":\"wheel_write\",\"mode\":\"DXL\",\"id\":%d,\"input\":%d,\"raw\":%u}", id, a, raw);
+        } else {
+            status_set("ERR WDXL id=%d %s", id, esp_err_to_name(err));
+        }
+        return;
+    }
+
+    if (strcmp(op, "WPROBE") == 0 &&
+        sscanf(cmd, "%23s %23s %d %d %d %d %d", op, mode_text, &id, &a, &b, &c, &d) >= 4) {
+        wheel_write_mode_t mode = WHEEL_MODE_ABS;
+        if (!parse_wheel_mode(mode_text, &mode)) {
+            status_set("ERR WPROBE mode=%s unsupported", mode_text);
+            return;
+        }
+        if (!is_supported_wheel((uint8_t)id)) {
+            status_set("ERR WPROBE id=%d unsupported", id);
+            return;
+        }
+        if (b == 0) {
+            b = 120;
+        }
+        if (c == 0) {
+            c = 10;
+        }
+        if (d == 0) {
+            d = 80;
+        }
+        status_wheel_probe(mode, (uint8_t)id, a, b, c, d);
+        return;
+    }
+
+    if (strcmp(op, "WSTOP") == 0 && sscanf(cmd, "%23s %d", op, &id) == 2) {
+        esp_err_t err = wheel_stop((uint8_t)id);
+        if (err == ESP_OK) {
+            status_wheel_snapshot();
+        } else {
+            status_set("ERR WSTOP id=%d %s", id, esp_err_to_name(err));
+        }
+        return;
+    }
+
+    if (strcmp(op, "WHOLD") == 0 && sscanf(cmd, "%23s %d", op, &id) == 2) {
+        esp_err_t err = wheel_hold_current((uint8_t)id);
+        if (err == ESP_OK) {
+            status_wheel_snapshot();
+        } else {
+            status_set("ERR WHOLD id=%d %s", id, esp_err_to_name(err));
+        }
+        return;
+    }
+
+    if (strcmp(op, "WRELAX") == 0 && sscanf(cmd, "%23s %d", op, &id) == 2) {
+        esp_err_t err = wheel_relax((uint8_t)id);
+        if (err == ESP_OK) {
+            status_wheel_snapshot();
+        } else {
+            status_set("ERR WRELAX id=%d %s", id, esp_err_to_name(err));
+        }
+        return;
+    }
+
     status_set("ERR unknown command: %s", cmd);
+}
+
+static void ble_command_task(void *arg)
+{
+    (void)arg;
+
+    ble_command_item_t item;
+    while (1) {
+        if (xQueueReceive(s_command_queue, &item, portMAX_DELAY) == pdTRUE) {
+            execute_command(item.text);
+        }
+    }
 }
 
 static int ble_access_cb(uint16_t conn_handle, uint16_t attr_handle,
@@ -560,12 +1094,19 @@ static int ble_access_cb(uint16_t conn_handle, uint16_t attr_handle,
     }
 
     if (ctxt->op == BLE_GATT_ACCESS_OP_WRITE_CHR) {
-        char cmd[BLE_MAX_TEXT_LEN];
-        rc = gatt_write_text(ctxt->om, cmd, sizeof(cmd));
+        ble_command_item_t item = {0};
+        rc = gatt_write_text(ctxt->om, item.text, sizeof(item.text));
         if (rc != 0) {
             return rc;
         }
-        execute_command(cmd);
+        if (s_command_queue == NULL) {
+            status_set("ERR command queue unavailable");
+            return BLE_ATT_ERR_UNLIKELY;
+        }
+        if (xQueueSend(s_command_queue, &item, 0) != pdTRUE) {
+            status_set("ERR command queue full");
+            return BLE_ATT_ERR_INSUFFICIENT_RES;
+        }
         return 0;
     }
 
@@ -727,6 +1268,16 @@ esp_err_t ble_control_init(void)
     rc = ble_svc_gap_device_name_set(BLE_DEVICE_NAME);
     if (rc != 0) {
         return ESP_FAIL;
+    }
+
+    s_command_queue = xQueueCreate(8, sizeof(ble_command_item_t));
+    if (s_command_queue == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+    if (xTaskCreate(ble_command_task, "ble_cmd", 6144, NULL, 5, NULL) != pdPASS) {
+        vQueueDelete(s_command_queue);
+        s_command_queue = NULL;
+        return ESP_ERR_NO_MEM;
     }
 
     nimble_port_freertos_init(ble_host_task);
