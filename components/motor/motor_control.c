@@ -9,9 +9,8 @@
 
 static const char *TAG = "motor";
 
-// 本项目使用的两个舵机的 ID 列表
-// ID 11 和 12 是舵机出厂时设定的地址（通过舵机厂商的配置工具修改）
-static const uint8_t MOTOR_IDS[MOTOR_COUNT] = { 11, 12 };
+// 本项目当前使用的两个舵机 ID
+static const uint8_t MOTOR_IDS[MOTOR_COUNT] = { 12, 22 };
 
 /**
  * @brief 初始化电机总线

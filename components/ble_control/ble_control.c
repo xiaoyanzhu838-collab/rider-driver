@@ -1,7 +1,8 @@
 #include "ble_control.h"
 
-#include <stdio.h>
+#include <stdbool.h>
 #include <stdarg.h>
+#include <stdio.h>
 #include <string.h>
 
 #include "esp_check.h"
@@ -12,10 +13,10 @@
 #include "host/ble_hs.h"
 #include "host/util/util.h"
 #include "motor_control.h"
-#include "scs_proto.h"
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
 #include "nvs_flash.h"
+#include "scs_proto.h"
 #include "services/gap/ble_svc_gap.h"
 #include "services/gatt/ble_svc_gatt.h"
 
@@ -24,11 +25,19 @@ static const char *TAG = "ble_control";
 #define BLE_DEVICE_NAME "RiderDriver"
 #define BLE_MAX_TEXT_LEN 192
 
+#define MOTOR_ID_12 12
+#define MOTOR_ID_22 22
+#define MOTOR_12_SAFE_DELTA 104
+#define MOTOR_22_SAFE_DELTA 112
+#define DEFAULT_MOVE_SPEED 200
+
 static uint8_t s_own_addr_type;
 static bool s_ble_started = false;
 static uint16_t s_status_handle;
 static char s_status_text[BLE_MAX_TEXT_LEN] = "ready";
 static char s_last_command[BLE_MAX_TEXT_LEN] = "";
+static int s_home12 = 599;
+static int s_home22 = 439;
 
 static const ble_uuid128_t s_service_uuid =
     BLE_UUID128_INIT(0x10, 0x32, 0x54, 0x76, 0x98, 0xba, 0xdc, 0xfe,
@@ -66,77 +75,184 @@ static int gatt_write_text(struct os_mbuf *om, char *dst, uint16_t max_len)
     return 0;
 }
 
-static bool clamp_goal(int *goal)
+static bool is_supported_servo(uint8_t id)
 {
-    bool changed = false;
-    if (*goal < 80) {
-        *goal = 80;
-        changed = true;
-    }
-    if (*goal > 940) {
-        *goal = 940;
-        changed = true;
-    }
-    return changed;
+    return id == MOTOR_ID_12 || id == MOTOR_ID_22;
 }
 
-static bool read_motor_snapshot(uint8_t id, motor_feedback_t *fb)
+static int servo_home(uint8_t id)
 {
-    return motor_read_feedback(id, fb) == ESP_OK;
+    return id == MOTOR_ID_12 ? s_home12 : s_home22;
 }
 
-static void fill_one_motor_snapshot(uint8_t id, char *out, size_t out_len)
+static int servo_edge(uint8_t id)
 {
-    motor_feedback_t fb = {0};
-    if (!read_motor_snapshot(id, &fb)) {
-        snprintf(out, out_len, "{\"id\":%u,\"ok\":0}", id);
+    return id == MOTOR_ID_12
+        ? (s_home12 - MOTOR_12_SAFE_DELTA)
+        : (s_home22 + MOTOR_22_SAFE_DELTA);
+}
+
+static int servo_min_goal(uint8_t id)
+{
+    return id == MOTOR_ID_12 ? servo_edge(id) : servo_home(id);
+}
+
+static int servo_max_goal(uint8_t id)
+{
+    return id == MOTOR_ID_12 ? servo_home(id) : servo_edge(id);
+}
+
+static int clamp_speed(int speed)
+{
+    if (speed <= 0) {
+        return DEFAULT_MOVE_SPEED;
+    }
+    if (speed > 400) {
+        return 400;
+    }
+    return speed;
+}
+
+static int clamp_percent(int percent)
+{
+    if (percent < 0) {
+        return 0;
+    }
+    if (percent > 100) {
+        return 100;
+    }
+    return percent;
+}
+
+static int clamp_goal_for_servo(uint8_t id, int goal)
+{
+    int min_goal = servo_min_goal(id);
+    int max_goal = servo_max_goal(id);
+    if (goal < min_goal) {
+        return min_goal;
+    }
+    if (goal > max_goal) {
+        return max_goal;
+    }
+    return goal;
+}
+
+static int pair_goal_for_percent(uint8_t id, int percent)
+{
+    percent = clamp_percent(percent);
+    if (id == MOTOR_ID_12) {
+        int delta = (MOTOR_12_SAFE_DELTA * percent + 50) / 100;
+        return s_home12 - delta;
+    }
+
+    int delta = (MOTOR_22_SAFE_DELTA * percent + 50) / 100;
+    return s_home22 + delta;
+}
+
+static bool read_goal_and_torque(uint8_t id, uint16_t *goal_out, uint8_t *torque_out)
+{
+    if (goal_out && scs_read_word(id, SCS_ADDR_GOAL_POSITION_L, goal_out) != ESP_OK) {
+        return false;
+    }
+    if (torque_out && scs_read_byte(id, SCS_ADDR_TORQUE_ENABLE, torque_out) != ESP_OK) {
+        return false;
+    }
+    return true;
+}
+
+static void status_snapshot(void)
+{
+    motor_feedback_t fb12 = {0};
+    motor_feedback_t fb22 = {0};
+    uint16_t goal12 = 0;
+    uint16_t goal22 = 0;
+    uint8_t torque12 = 0;
+    uint8_t torque22 = 0;
+
+    bool ok12 = motor_read_feedback(MOTOR_ID_12, &fb12) == ESP_OK &&
+                read_goal_and_torque(MOTOR_ID_12, &goal12, &torque12);
+    bool ok22 = motor_read_feedback(MOTOR_ID_22, &fb22) == ESP_OK &&
+                read_goal_and_torque(MOTOR_ID_22, &goal22, &torque22);
+
+    if (!ok12 || !ok22) {
+        status_set("ERR SNAP ok12=%d ok22=%d", ok12 ? 1 : 0, ok22 ? 1 : 0);
         return;
     }
 
-    uint8_t torque = 0xFF;
-    uint8_t mode = 0xFF;
-    uint16_t goal = 0xFFFF;
-    uint16_t goal_speed = 0xFFFF;
-    (void)scs_read_byte(id, SCS_ADDR_TORQUE_ENABLE, &torque);
-    (void)scs_read_byte(id, SCS_ADDR_MODE, &mode);
-    (void)scs_read_word(id, SCS_ADDR_GOAL_POSITION_L, &goal);
-    (void)scs_read_word(id, SCS_ADDR_GOAL_SPEED_L, &goal_speed);
-
-    snprintf(out, out_len,
-             "{\"id\":%u,\"ok\":1,\"pos\":%u,\"spd\":%u,\"load\":%u,\"v\":%u,\"t\":%u,\"moving\":%u,"
-             "\"torque\":%u,\"mode\":%u,\"goal\":%u,\"goal_speed\":%u}",
-             id, fb.position, fb.speed, fb.load, fb.voltage, fb.temperature, fb.moving,
-             torque, mode, goal, goal_speed);
+    status_set(
+        "{\"h12\":%d,\"e12\":%d,\"p12\":%u,\"g12\":%u,\"t12\":%u,"
+        "\"h22\":%d,\"e22\":%d,\"p22\":%u,\"g22\":%u,\"t22\":%u}",
+        s_home12, servo_edge(MOTOR_ID_12), fb12.position, goal12, torque12,
+        s_home22, servo_edge(MOTOR_ID_22), fb22.position, goal22, torque22);
 }
 
-static void fill_status_snapshot(char *out, size_t out_len)
+static esp_err_t set_single_safe_goal(uint8_t id, int goal, int speed)
 {
-    motor_feedback_t fb1 = {0};
-    motor_feedback_t fb2 = {0};
-    esp_err_t err1 = motor_read_feedback(11, &fb1);
-    esp_err_t err2 = motor_read_feedback(12, &fb2);
+    if (!is_supported_servo(id)) {
+        return ESP_ERR_INVALID_ARG;
+    }
 
-    snprintf(out, out_len,
-             "{\"m1\":{\"pos\":%u,\"spd\":%u,\"load\":%u,\"v\":%u,\"t\":%u},"
-             "\"m2\":{\"pos\":%u,\"spd\":%u,\"load\":%u,\"v\":%u,\"t\":%u},"
-             "\"ok1\":%d,\"ok2\":%d}",
-             fb1.position, fb1.speed, fb1.load, fb1.voltage, fb1.temperature,
-             fb2.position, fb2.speed, fb2.load, fb2.voltage, fb2.temperature,
-             err1 == ESP_OK ? 1 : 0, err2 == ESP_OK ? 1 : 0);
+    goal = clamp_goal_for_servo(id, goal);
+    speed = clamp_speed(speed);
+
+    ESP_RETURN_ON_ERROR(motor_set_torque(id, true), TAG, "torque on failed");
+    ESP_RETURN_ON_ERROR(scs_write_word(id, SCS_ADDR_GOAL_POSITION_L, (uint16_t)goal),
+                        TAG, "goal write failed");
+    return scs_write_word(id, SCS_ADDR_GOAL_SPEED_L, (uint16_t)speed);
+}
+
+static esp_err_t set_pair_percent(int percent, int speed)
+{
+    const uint16_t goal12 = (uint16_t)pair_goal_for_percent(MOTOR_ID_12, percent);
+    const uint16_t goal22 = (uint16_t)pair_goal_for_percent(MOTOR_ID_22, percent);
+    const uint16_t speed_u16 = (uint16_t)clamp_speed(speed);
+    uint8_t pair_data[10] = {
+        MOTOR_ID_12,
+        (uint8_t)(goal12 & 0xFF),
+        (uint8_t)(goal12 >> 8),
+        (uint8_t)(speed_u16 & 0xFF),
+        (uint8_t)(speed_u16 >> 8),
+        MOTOR_ID_22,
+        (uint8_t)(goal22 & 0xFF),
+        (uint8_t)(goal22 >> 8),
+        (uint8_t)(speed_u16 & 0xFF),
+        (uint8_t)(speed_u16 >> 8),
+    };
+
+    ESP_RETURN_ON_ERROR(motor_set_torque(MOTOR_ID_12, true), TAG, "torque on 12 failed");
+    ESP_RETURN_ON_ERROR(motor_set_torque(MOTOR_ID_22, true), TAG, "torque on 22 failed");
+    return scs_sync_write(SCS_ADDR_GOAL_POSITION_L, 4, pair_data, 2);
+}
+
+static esp_err_t relax_all(void)
+{
+    ESP_RETURN_ON_ERROR(motor_set_torque(MOTOR_ID_12, false), TAG, "relax 12 failed");
+    return motor_set_torque(MOTOR_ID_22, false);
+}
+
+static esp_err_t capture_home_positions(void)
+{
+    motor_feedback_t fb12 = {0};
+    motor_feedback_t fb22 = {0};
+    ESP_RETURN_ON_ERROR(motor_read_feedback(MOTOR_ID_12, &fb12), TAG, "read 12 failed");
+    ESP_RETURN_ON_ERROR(motor_read_feedback(MOTOR_ID_22, &fb22), TAG, "read 22 failed");
+
+    s_home12 = fb12.position;
+    s_home22 = fb22.position;
+    return ESP_OK;
 }
 
 static void execute_command(const char *cmd)
 {
-    char op[16] = {0};
+    char op[24] = {0};
     int id = 0;
     int a = 0;
     int b = 0;
-    int c = 0;
 
     strncpy(s_last_command, cmd, sizeof(s_last_command) - 1);
     s_last_command[sizeof(s_last_command) - 1] = '\0';
 
-    if (sscanf(cmd, "%15s", op) != 1) {
+    if (sscanf(cmd, "%23s", op) != 1) {
         status_set("ERR empty command");
         return;
     }
@@ -147,54 +263,93 @@ static void execute_command(const char *cmd)
     }
 
     if (strcmp(op, "HELP") == 0) {
-        status_set("OK commands: HELP PING GET READ TORQUE WHEEL WHEELSTOP STOP");
+        status_set("OK cmds: GET PAIR HOME EDGE SET TORQUE RELAX CAPTURE_HOME PING");
         return;
     }
 
-    if (strcmp(op, "GET") == 0) {
-        if (sscanf(cmd, "%15s %d", op, &id) == 2) {
-            fill_one_motor_snapshot((uint8_t)id, s_status_text, sizeof(s_status_text));
-            ble_gatts_chr_updated(s_status_handle);
-            ESP_LOGI(TAG, "%s", s_status_text);
+    if (strcmp(op, "GET") == 0 || strcmp(op, "READ") == 0) {
+        status_snapshot();
+        return;
+    }
+
+    if (strcmp(op, "CAPTURE_HOME") == 0) {
+        esp_err_t err = capture_home_positions();
+        if (err == ESP_OK) {
+            status_snapshot();
+        } else {
+            status_set("ERR CAPTURE_HOME %s", esp_err_to_name(err));
+        }
+        return;
+    }
+
+    if (strcmp(op, "RELAX") == 0) {
+        esp_err_t err = relax_all();
+        if (err == ESP_OK) {
+            status_snapshot();
+        } else {
+            status_set("ERR RELAX %s", esp_err_to_name(err));
+        }
+        return;
+    }
+
+    if (strcmp(op, "HOME") == 0) {
+        int speed = DEFAULT_MOVE_SPEED;
+        (void)sscanf(cmd, "%23s %d", op, &speed);
+        esp_err_t err = set_pair_percent(0, speed);
+        if (err == ESP_OK) {
+            status_snapshot();
+        } else {
+            status_set("ERR HOME %s", esp_err_to_name(err));
+        }
+        return;
+    }
+
+    if (strcmp(op, "EDGE") == 0) {
+        int speed = DEFAULT_MOVE_SPEED;
+        (void)sscanf(cmd, "%23s %d", op, &speed);
+        esp_err_t err = set_pair_percent(100, speed);
+        if (err == ESP_OK) {
+            status_snapshot();
+        } else {
+            status_set("ERR EDGE %s", esp_err_to_name(err));
+        }
+        return;
+    }
+
+    if (strcmp(op, "PAIR") == 0 && sscanf(cmd, "%23s %d %d", op, &a, &b) >= 2) {
+        int percent = clamp_percent(a);
+        int speed = clamp_speed(b);
+        esp_err_t err = set_pair_percent(percent, speed);
+        if (err == ESP_OK) {
+            status_snapshot();
+        } else {
+            status_set("ERR PAIR %s", esp_err_to_name(err));
+        }
+        return;
+    }
+
+    if (strcmp(op, "SET") == 0 && sscanf(cmd, "%23s %d %d %d", op, &id, &a, &b) >= 3) {
+        int speed = clamp_speed(b);
+        esp_err_t err = set_single_safe_goal((uint8_t)id, a, speed);
+        if (err == ESP_OK) {
+            status_snapshot();
+        } else {
+            status_set("ERR SET id=%d %s", id, esp_err_to_name(err));
+        }
+        return;
+    }
+
+    if (strcmp(op, "TORQUE") == 0 && sscanf(cmd, "%23s %d %d", op, &id, &a) == 3) {
+        if (!is_supported_servo((uint8_t)id)) {
+            status_set("ERR TORQUE id=%d unsupported", id);
             return;
         }
-
-        fill_status_snapshot(s_status_text, sizeof(s_status_text));
-        ble_gatts_chr_updated(s_status_handle);
-        ESP_LOGI(TAG, "%s", s_status_text);
-        return;
-    }
-
-    if (strcmp(op, "TORQUE") == 0 && sscanf(cmd, "%15s %d %d", op, &id, &a) == 3) {
         esp_err_t err = motor_set_torque((uint8_t)id, a != 0);
-        status_set("%s TORQUE id=%d enable=%d", err == ESP_OK ? "OK" : "ERR", id, a);
-        return;
-    }
-
-    if (strcmp(op, "WHEEL") == 0 && sscanf(cmd, "%15s %d %d", op, &id, &a) == 3) {
-        int16_t wheel_speed = (int16_t)a;
-        esp_err_t err = motor_set_torque((uint8_t)id, true);
         if (err == ESP_OK) {
-            err = scs_write_word((uint8_t)id, SCS_ADDR_GOAL_SPEED_L, (uint16_t)wheel_speed);
+            status_snapshot();
+        } else {
+            status_set("ERR TORQUE id=%d %s", id, esp_err_to_name(err));
         }
-        status_set("%s WHEEL id=%d speed=%d", err == ESP_OK ? "OK" : "ERR", id, a);
-        return;
-    }
-
-    if ((strcmp(op, "WHEELSTOP") == 0 && sscanf(cmd, "%15s %d", op, &id) == 2) ||
-        (strcmp(op, "STOP") == 0 && sscanf(cmd, "%15s %d", op, &id) == 2)) {
-        esp_err_t err = scs_write_word((uint8_t)id, SCS_ADDR_GOAL_SPEED_L, 0);
-        if (err == ESP_OK) {
-            err = motor_set_torque((uint8_t)id, false);
-        }
-        status_set("%s WHEELSTOP id=%d", err == ESP_OK ? "OK" : "ERR", id);
-        return;
-    }
-
-    if (strcmp(op, "READ") == 0 && sscanf(cmd, "%15s %d", op, &id) == 2) {
-        fill_one_motor_snapshot((uint8_t)id, s_status_text, sizeof(s_status_text));
-        ble_gatts_chr_updated(s_status_handle);
-        ESP_LOGI(TAG, "%s", s_status_text);
         return;
     }
 
@@ -272,7 +427,8 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
         ble_control_advertise();
         return 0;
     case BLE_GAP_EVENT_SUBSCRIBE:
-        ESP_LOGI(TAG, "subscribe attr=%u notify=%d", event->subscribe.attr_handle, event->subscribe.cur_notify);
+        ESP_LOGI(TAG, "subscribe attr=%u notify=%d",
+                 event->subscribe.attr_handle, event->subscribe.cur_notify);
         return 0;
     default:
         return 0;
