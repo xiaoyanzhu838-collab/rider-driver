@@ -266,7 +266,7 @@ esp_err_t scs_txrx(uint8_t id, uint8_t instruction,
 
     size_t tx_len = 6 + param_len;  // 实际发送字节数 = 帧头(2)+ID(1)+LEN(1)+INST(1)+参数(N)+校验和(1)
 
-    hex_dump("TX", pkt, tx_len);
+    hex_dump("UART2_TX", pkt, tx_len);
 
     // --- 第二步：清空 RX 缓冲区，丢弃之前可能残留的数据 ---
     uart_flush_input(SCS_UART_NUM);
@@ -293,9 +293,9 @@ esp_err_t scs_txrx(uint8_t id, uint8_t instruction,
         uint8_t echo_buf[64];
         int echo_n = uart_read_bytes(SCS_UART_NUM, echo_buf, sizeof(echo_buf), 0);  // 非阻塞读取
         if (echo_n > 0) {
-            hex_dump("ECHO_FLUSH", echo_buf, echo_n);
+            hex_dump("UART2_ECHO_FLUSH", echo_buf, echo_n);
         } else {
-            ESP_LOGD(TAG, "ECHO_FLUSH: 0 bytes (no echo)");
+            ESP_LOGD(TAG, "UART2_ECHO_FLUSH: 0 bytes (no echo)");
         }
     }
 
@@ -343,14 +343,14 @@ esp_err_t scs_txrx(uint8_t id, uint8_t instruction,
 
     // 始终找不到帧头，通信异常
     if (hdr_pos < 0) {
-        hex_dump("RX_NO_HDR", rxbuf, rx_total);
+        hex_dump("UART2_RX_NO_HDR", rxbuf, rx_total);
         return ESP_ERR_INVALID_RESPONSE;
     }
 
     // 如果帧头不在 offset 0，说明前面有残留的回环字节泄漏
     // 将数据前移使帧头对齐到 offset 0
     if (hdr_pos > 0) {
-        hex_dump("RX_ECHO_LEAK", rxbuf, hdr_pos);
+        hex_dump("UART2_RX_ECHO_LEAK", rxbuf, hdr_pos);
         memmove(rxbuf, &rxbuf[hdr_pos], rx_total - hdr_pos);
         rx_total -= hdr_pos;
     }
@@ -370,7 +370,7 @@ esp_err_t scs_txrx(uint8_t id, uint8_t instruction,
     uint8_t rx_len_field = rxbuf[3];
     if (rx_len_field < 2 || rx_len_field > SCS_MAX_PKT_LEN - 4) {
         ESP_LOGW(TAG, "bad rx LEN=%u", rx_len_field);
-        hex_dump("RX_BAD", rxbuf, rx_total);
+        hex_dump("UART2_RX_BAD", rxbuf, rx_total);
         return ESP_ERR_INVALID_RESPONSE;
     }
 
@@ -386,7 +386,7 @@ esp_err_t scs_txrx(uint8_t id, uint8_t instruction,
         rx_total += n;
     }
 
-    hex_dump("RX", rxbuf, need_total);
+    hex_dump("UART2_RX", rxbuf, need_total);
 
     // --- 第七步：校验和验证 ---
     uint8_t calc_chk = scs_checksum(rxbuf, need_total);    // 本地计算的校验和
