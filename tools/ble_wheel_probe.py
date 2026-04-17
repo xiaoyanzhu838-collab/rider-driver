@@ -87,10 +87,33 @@ def parse_json_status(text: str) -> Optional[dict]:
         return None
 
 
+def as_i16(value: Optional[int]) -> Optional[int]:
+    if value is None:
+        return None
+    value &= 0xFFFF
+    if value >= 0x8000:
+        return value - 0x10000
+    return value
+
+
 def classify_probe_direction(payload: dict) -> str:
-    total = int(payload.get("sum", 0))
+    mode = str(payload.get("mode", "")).upper()
+    raw = payload.get("raw")
+    last_speed_i16 = as_i16(payload.get("last_s"))
     pos_steps = int(payload.get("pos", 0))
     neg_steps = int(payload.get("neg", 0))
+
+    if mode == "I16" and isinstance(raw, int) and raw >= 0xFF00 and last_speed_i16 is not None:
+        if last_speed_i16 < 0:
+            return "reverse"
+        if last_speed_i16 > 0:
+            return "forward"
+
+    total = int(payload.get("sum", 0))
+    if neg_steps >= pos_steps + 4:
+        return "reverse"
+    if pos_steps >= neg_steps + 4:
+        return "forward"
     if total < 0 or (neg_steps > pos_steps and neg_steps > 0):
         return "reverse"
     if total > 0 or (pos_steps > neg_steps and pos_steps > 0):
@@ -145,18 +168,63 @@ class RiderBleProbe:
             return
 
         address = await self.resolve_address()
-        self.client = BleakClient(address, timeout=self.timeout)
-        await self.client.connect()
-        await self.client.start_notify(STATUS_UUID, self._handle_notification)
-        print(f"[{host_ts()}] connected to {DEVICE_NAME} {address}")
-        self.emit_event(
-            {
-                "host_ts": host_ts(),
-                "kind": "connect",
-                "device_name": DEVICE_NAME,
-                "address": address,
-            }
-        )
+        last_error: Optional[Exception] = None
+        for attempt in range(1, 4):
+            try:
+                self.client = BleakClient(address, timeout=self.timeout)
+                await self.client.connect()
+                await self._ensure_gatt_ready()
+                await self.client.start_notify(STATUS_UUID, self._handle_notification)
+                print(f"[{host_ts()}] connected to {DEVICE_NAME} {address}")
+                self.emit_event(
+                    {
+                        "host_ts": host_ts(),
+                        "kind": "connect",
+                        "device_name": DEVICE_NAME,
+                        "address": address,
+                        "attempt": attempt,
+                    }
+                )
+                return
+            except Exception as exc:
+                last_error = exc
+                self.emit_event(
+                    {
+                        "host_ts": host_ts(),
+                        "kind": "connect_retry",
+                        "device_name": DEVICE_NAME,
+                        "address": address,
+                        "attempt": attempt,
+                        "error": str(exc),
+                    }
+                )
+                await self.disconnect()
+                await asyncio.sleep(0.6 * attempt)
+        raise RuntimeError(f"failed to connect to {DEVICE_NAME}: {last_error}")
+
+    async def _ensure_gatt_ready(self) -> None:
+        client = self.client
+        if not client:
+            raise RuntimeError("BLE client is not created")
+
+        last_error: Optional[Exception] = None
+        for attempt in range(1, 6):
+            try:
+                get_services = getattr(client, "get_services", None)
+                if callable(get_services):
+                    await get_services()
+                services = client.services
+                if services is not None:
+                    service = services.get_service(SERVICE_UUID)
+                    if service is not None:
+                        chars = {str(char.uuid).lower() for char in service.characteristics}
+                        if COMMAND_UUID.lower() in chars and STATUS_UUID.lower() in chars:
+                            return
+                raise RuntimeError("required BLE characteristics not present yet")
+            except Exception as exc:
+                last_error = exc
+                await asyncio.sleep(0.35 * attempt)
+        raise RuntimeError(f"GATT discovery did not find RiderDriver characteristics: {last_error}")
 
     async def disconnect(self) -> None:
         client = self.client
@@ -256,8 +324,11 @@ class RiderBleProbe:
         except TimeoutError:
             text = await self.read_status()
             payload = parse_json_status(text)
-            if accepted_kinds is not None and payload and payload.get("kind") not in accepted_kinds:
-                raise
+            if accepted_kinds is not None:
+                if not payload or payload.get("kind") not in accepted_kinds:
+                    raise TimeoutError(
+                        f"Timed out waiting for kinds {accepted_kinds}, last status was: {text}"
+                    )
             return ProbeResult(host_ts(), command, text, payload)
 
 
@@ -300,6 +371,13 @@ async def run_probe_wheel(args: argparse.Namespace) -> int:
             summary[key] = []
             for mode in args.modes:
                 for value in args.values:
+                    if args.pre_hold:
+                        await probe.send_command(
+                            f"WHOLD {wheel_id}",
+                            wait_timeout=args.wait_timeout,
+                            settle_after_write=args.settle_after_write,
+                        )
+                        await asyncio.sleep(args.pre_hold_settle_ms / 1000.0)
                     command = (
                         f"WPROBE {mode} {wheel_id} {value} "
                         f"{args.settle_ms} {args.samples} {args.interval_ms}"
@@ -321,15 +399,17 @@ async def run_probe_wheel(args: argparse.Namespace) -> int:
                         "neg": payload.get("neg"),
                         "raw": payload.get("raw"),
                         "max_s": payload.get("max_s"),
+                        "last_s_i16": as_i16(payload.get("last_s")),
                     }
                     summary[key].append(row)
                     print(
-                        "[{ts}] {cmd} -> direction={direction} sum={sum_} raw={raw} max_s={max_s}".format(
+                        "[{ts}] {cmd} -> direction={direction} sum={sum_} raw={raw} last_s_i16={last_s_i16} max_s={max_s}".format(
                             ts=host_ts(),
                             cmd=command,
                             direction=direction,
                             sum_=row["sum"],
                             raw=row["raw"],
+                            last_s_i16=row["last_s_i16"],
                             max_s=row["max_s"],
                         )
                     )
@@ -340,7 +420,7 @@ async def run_probe_wheel(args: argparse.Namespace) -> int:
             print(key)
             for row in rows:
                 print(
-                    "  {mode:>3} {value:>6} -> {direction:<7} sum={sum!s:<6} raw={raw!s:<6} max_s={max_s!s}".format(
+                    "  {mode:>3} {value:>6} -> {direction:<7} sum={sum!s:<6} raw={raw!s:<6} last_s_i16={last_s_i16!s:<6} max_s={max_s!s}".format(
                         **row
                     )
                 )
@@ -412,6 +492,8 @@ def build_parser() -> argparse.ArgumentParser:
     probe_wheel.add_argument("--samples", type=int, default=10, help="Probe sample count")
     probe_wheel.add_argument("--interval-ms", type=int, default=80, help="Probe sample interval ms")
     probe_wheel.add_argument("--cooldown-ms", type=int, default=350, help="Pause between probes")
+    probe_wheel.add_argument("--pre-hold", action="store_true", help="Run WHOLD <id> before each probe")
+    probe_wheel.add_argument("--pre-hold-settle-ms", type=int, default=180, help="Delay after WHOLD before probing")
     probe_wheel.add_argument("--wait-timeout", type=float, default=5.0, help="Seconds to wait for probe result")
     probe_wheel.add_argument("--settle-after-write", type=float, default=0.15, help="Delay after write before waiting")
     probe_wheel.set_defaults(func=run_probe_wheel)

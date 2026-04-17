@@ -36,6 +36,8 @@ static const char *TAG = "ble_control";
 #define WHEEL_SAFE_OPEN_PERCENT 20
 #define WHEEL_HOLD_SPEED 10
 #define WHEEL_MAX_GOAL_SPEED 1064
+#define WHEEL_SIGNED_SPEED_LIMIT 140
+#define WHEEL_SIGNED_SPEED_RECOMMENDED 120
 
 static uint8_t s_own_addr_type;
 static bool s_ble_started = false;
@@ -223,6 +225,17 @@ static int clamp_wheel_goal_speed(int value)
     return value;
 }
 
+static int clamp_wheel_signed_speed(int value)
+{
+    if (value < -WHEEL_SIGNED_SPEED_LIMIT) {
+        return -WHEEL_SIGNED_SPEED_LIMIT;
+    }
+    if (value > WHEEL_SIGNED_SPEED_LIMIT) {
+        return WHEEL_SIGNED_SPEED_LIMIT;
+    }
+    return value;
+}
+
 static int clamp_i16_range(int value)
 {
     if (value < -32768) {
@@ -322,6 +335,11 @@ static bool parse_wheel_mode(const char *text, wheel_write_mode_t *mode_out)
 static uint16_t encode_wheel_signed_i16(int value)
 {
     return (uint16_t)(int16_t)clamp_i16_range(value);
+}
+
+static int decode_wheel_signed_i16(uint16_t value)
+{
+    return (int16_t)value;
 }
 
 static uint16_t encode_wheel_dxl_signed(int value)
@@ -506,12 +524,14 @@ static void status_wheel_snapshot(void)
     }
 
     status_set(
-        "{\"kind\":\"wheel\",\"safe\":%d,"
-        "\"p11\":%u,\"g11\":%u,\"t11\":%u,\"gs11\":%u,\"s11\":%u,\"l11\":%u,\"v11\":%u,\"tmp11\":%u,\"m11\":%u,"
-        "\"p21\":%u,\"g21\":%u,\"t21\":%u,\"gs21\":%u,\"s21\":%u,\"l21\":%u,\"v21\":%u,\"tmp21\":%u,\"m21\":%u}",
-        WHEEL_SAFE_OPEN_PERCENT,
-        fb11.position, goal11, torque11, goal_speed11, fb11.speed, fb11.load, fb11.voltage, fb11.temperature, fb11.moving,
-        fb21.position, goal21, torque21, goal_speed21, fb21.speed, fb21.load, fb21.voltage, fb21.temperature, fb21.moving);
+        "{\"kind\":\"wheel\",\"safe\":%d,\"limit\":%d,\"recommend\":%d,"
+        "\"p11\":%u,\"g11\":%u,\"t11\":%u,\"gs11\":%u,\"gsi11\":%d,\"s11\":%u,\"si11\":%d,\"l11\":%u,\"v11\":%u,\"tmp11\":%u,\"m11\":%u,"
+        "\"p21\":%u,\"g21\":%u,\"t21\":%u,\"gs21\":%u,\"gsi21\":%d,\"s21\":%u,\"si21\":%d,\"l21\":%u,\"v21\":%u,\"tmp21\":%u,\"m21\":%u}",
+        WHEEL_SAFE_OPEN_PERCENT, WHEEL_SIGNED_SPEED_LIMIT, WHEEL_SIGNED_SPEED_RECOMMENDED,
+        fb11.position, goal11, torque11, goal_speed11, decode_wheel_signed_i16(goal_speed11),
+        fb11.speed, decode_wheel_signed_i16(fb11.speed), fb11.load, fb11.voltage, fb11.temperature, fb11.moving,
+        fb21.position, goal21, torque21, goal_speed21, decode_wheel_signed_i16(goal_speed21),
+        fb21.speed, decode_wheel_signed_i16(fb21.speed), fb21.load, fb21.voltage, fb21.temperature, fb21.moving);
 }
 
 static void status_snapshot(void)
@@ -645,13 +665,15 @@ static esp_err_t ensure_wheel_safe_open(void)
 
 static esp_err_t wheel_set_speed(uint8_t id, int speed)
 {
+    uint16_t raw = encode_wheel_signed_i16(clamp_wheel_signed_speed(speed));
+
     if (!is_supported_wheel(id)) {
         return ESP_ERR_INVALID_ARG;
     }
 
     ESP_RETURN_ON_ERROR(ensure_wheel_safe_open(), TAG, "safe open failed");
     ESP_RETURN_ON_ERROR(motor_set_torque(id, true), TAG, "wheel torque on failed");
-    return scs_write_word(id, SCS_ADDR_GOAL_SPEED_L, (uint16_t)clamp_wheel_goal_speed(speed));
+    return scs_write_word(id, SCS_ADDR_GOAL_SPEED_L, raw);
 }
 
 static esp_err_t wheel_set_encoded(uint8_t id, wheel_write_mode_t mode, int value, uint16_t *raw_out)
@@ -816,7 +838,7 @@ static void execute_command(const char *cmd)
     }
 
     if (strcmp(op, "HELP") == 0) {
-        status_set("OK cmds: GET WGET SCAN CFG LED TL COMP RESTORE_RUNTIME PAIR HOME EDGE SET TORQUE RELAX CAPTURE_HOME WSET WRAW WI16 WDXL WPROBE WSTOP WHOLD WRELAX PING");
+        status_set("OK cmds: GET WGET SCAN CFG LED TL COMP RESTORE_RUNTIME PAIR HOME EDGE SET TORQUE RELAX CAPTURE_HOME WSET(signed) WRAW WI16 WDXL WPROBE WSTOP WHOLD WRELAX PING");
         return;
     }
 
