@@ -23,7 +23,7 @@
 static const char *TAG = "ble_control";
 
 #define BLE_DEVICE_NAME "RiderDriver"
-#define BLE_MAX_TEXT_LEN 192
+#define BLE_MAX_TEXT_LEN 512
 
 #define MOTOR_ID_12 12
 #define MOTOR_ID_22 22
@@ -50,6 +50,30 @@ static const ble_uuid128_t s_status_uuid =
                      0x10, 0x32, 0x54, 0x76, 0x98, 0xba, 0xdc, 0xfe);
 
 static bool ble_control_advertise(void);
+
+typedef struct {
+    uint16_t model;
+    uint8_t firmware;
+    uint8_t id;
+    uint8_t baud;
+    uint8_t return_delay;
+    uint16_t min_angle;
+    uint16_t max_angle;
+    uint8_t temp_limit;
+    uint8_t min_voltage_raw;
+    uint8_t max_voltage_raw;
+    uint16_t max_torque;
+    uint8_t status_return_level;
+    uint8_t alarm_led;
+    uint8_t shutdown;
+    uint8_t led;
+    uint8_t cw_margin;
+    uint8_t ccw_margin;
+    uint8_t cw_slope;
+    uint8_t ccw_slope;
+    uint16_t torque_limit;
+    uint8_t lock;
+} servo_config_t;
 
 static void status_set(const char *fmt, ...)
 {
@@ -137,6 +161,28 @@ static int clamp_goal_for_servo(uint8_t id, int goal)
     return goal;
 }
 
+static int clamp_u8_range(int value, int min_value, int max_value)
+{
+    if (value < min_value) {
+        return min_value;
+    }
+    if (value > max_value) {
+        return max_value;
+    }
+    return value;
+}
+
+static int clamp_torque_limit(int value)
+{
+    if (value < 0) {
+        return 0;
+    }
+    if (value > 1023) {
+        return 1023;
+    }
+    return value;
+}
+
 static int pair_goal_for_percent(uint8_t id, int percent)
 {
     percent = clamp_percent(percent);
@@ -160,6 +206,57 @@ static bool read_goal_and_torque(uint8_t id, uint16_t *goal_out, uint8_t *torque
     return true;
 }
 
+static bool read_servo_config(uint8_t id, servo_config_t *out)
+{
+    memset(out, 0, sizeof(*out));
+    return scs_read_word(id, SCS_ADDR_MODEL_L, &out->model) == ESP_OK &&
+           scs_read_byte(id, SCS_ADDR_VERSION, &out->firmware) == ESP_OK &&
+           scs_read_byte(id, SCS_ADDR_ID, &out->id) == ESP_OK &&
+           scs_read_byte(id, SCS_ADDR_BAUD_RATE, &out->baud) == ESP_OK &&
+           scs_read_byte(id, SCS_ADDR_RETURN_DELAY, &out->return_delay) == ESP_OK &&
+           scs_read_word(id, SCS_ADDR_MIN_ANGLE_L, &out->min_angle) == ESP_OK &&
+           scs_read_word(id, SCS_ADDR_MAX_ANGLE_L, &out->max_angle) == ESP_OK &&
+           scs_read_byte(id, 0x0B, &out->temp_limit) == ESP_OK &&
+           scs_read_byte(id, 0x0C, &out->min_voltage_raw) == ESP_OK &&
+           scs_read_byte(id, 0x0D, &out->max_voltage_raw) == ESP_OK &&
+           scs_read_word(id, 0x0E, &out->max_torque) == ESP_OK &&
+           scs_read_byte(id, 0x10, &out->status_return_level) == ESP_OK &&
+           scs_read_byte(id, 0x11, &out->alarm_led) == ESP_OK &&
+           scs_read_byte(id, 0x12, &out->shutdown) == ESP_OK &&
+           scs_read_byte(id, 0x19, &out->led) == ESP_OK &&
+           scs_read_byte(id, 0x1A, &out->cw_margin) == ESP_OK &&
+           scs_read_byte(id, 0x1B, &out->ccw_margin) == ESP_OK &&
+           scs_read_byte(id, 0x1C, &out->cw_slope) == ESP_OK &&
+           scs_read_byte(id, 0x1D, &out->ccw_slope) == ESP_OK &&
+           scs_read_word(id, 0x22, &out->torque_limit) == ESP_OK &&
+           scs_read_byte(id, 0x2F, &out->lock) == ESP_OK;
+}
+
+static void status_config(uint8_t id)
+{
+    servo_config_t cfg = {0};
+    if (!is_supported_servo(id)) {
+        status_set("ERR CFG id=%u unsupported", id);
+        return;
+    }
+    if (!read_servo_config(id, &cfg)) {
+        status_set("ERR CFG id=%u read_failed", id);
+        return;
+    }
+
+    status_set(
+        "{\"kind\":\"cfg\",\"id\":%u,\"model\":%u,\"fw\":%u,\"baud\":%u,"
+        "\"delay\":%u,\"amin\":%u,\"amax\":%u,\"tmpl\":%u,\"vmin\":%u,"
+        "\"vmax\":%u,\"tmax\":%u,\"sret\":%u,\"alarm\":%u,\"shutdown\":%u,"
+        "\"led\":%u,\"cwm\":%u,\"ccwm\":%u,\"cws\":%u,\"ccws\":%u,"
+        "\"tlim\":%u,\"lock\":%u}",
+        cfg.id, cfg.model, cfg.firmware, cfg.baud, cfg.return_delay,
+        cfg.min_angle, cfg.max_angle, cfg.temp_limit, cfg.min_voltage_raw,
+        cfg.max_voltage_raw, cfg.max_torque, cfg.status_return_level,
+        cfg.alarm_led, cfg.shutdown, cfg.led, cfg.cw_margin, cfg.ccw_margin,
+        cfg.cw_slope, cfg.ccw_slope, cfg.torque_limit, cfg.lock);
+}
+
 static void status_snapshot(void)
 {
     motor_feedback_t fb12 = {0};
@@ -180,10 +277,14 @@ static void status_snapshot(void)
     }
 
     status_set(
-        "{\"h12\":%d,\"e12\":%d,\"p12\":%u,\"g12\":%u,\"t12\":%u,"
-        "\"h22\":%d,\"e22\":%d,\"p22\":%u,\"g22\":%u,\"t22\":%u}",
+        "{\"kind\":\"snap\",\"h12\":%d,\"e12\":%d,\"p12\":%u,\"g12\":%u,"
+        "\"t12\":%u,\"s12\":%u,\"l12\":%u,\"v12\":%u,\"tmp12\":%u,\"m12\":%u,"
+        "\"h22\":%d,\"e22\":%d,\"p22\":%u,\"g22\":%u,\"t22\":%u,\"s22\":%u,"
+        "\"l22\":%u,\"v22\":%u,\"tmp22\":%u,\"m22\":%u}",
         s_home12, servo_edge(MOTOR_ID_12), fb12.position, goal12, torque12,
-        s_home22, servo_edge(MOTOR_ID_22), fb22.position, goal22, torque22);
+        fb12.speed, fb12.load, fb12.voltage, fb12.temperature, fb12.moving,
+        s_home22, servo_edge(MOTOR_ID_22), fb22.position, goal22, torque22,
+        fb22.speed, fb22.load, fb22.voltage, fb22.temperature, fb22.moving);
 }
 
 static esp_err_t set_single_safe_goal(uint8_t id, int goal, int speed)
@@ -242,12 +343,52 @@ static esp_err_t capture_home_positions(void)
     return ESP_OK;
 }
 
+static esp_err_t set_led(uint8_t id, int value)
+{
+    if (!is_supported_servo(id)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    return scs_write_byte(id, 0x19, value != 0 ? 1 : 0);
+}
+
+static esp_err_t set_torque_limit_value(uint8_t id, int value)
+{
+    if (!is_supported_servo(id)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    return scs_write_word(id, 0x22, (uint16_t)clamp_torque_limit(value));
+}
+
+static esp_err_t set_compliance(uint8_t id, int cw_margin, int ccw_margin, int cw_slope, int ccw_slope)
+{
+    if (!is_supported_servo(id)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    ESP_RETURN_ON_ERROR(scs_write_byte(id, 0x1A, (uint8_t)clamp_u8_range(cw_margin, 0, 16)),
+                        TAG, "cw margin write failed");
+    ESP_RETURN_ON_ERROR(scs_write_byte(id, 0x1B, (uint8_t)clamp_u8_range(ccw_margin, 0, 16)),
+                        TAG, "ccw margin write failed");
+    ESP_RETURN_ON_ERROR(scs_write_byte(id, 0x1C, (uint8_t)clamp_u8_range(cw_slope, 1, 64)),
+                        TAG, "cw slope write failed");
+    return scs_write_byte(id, 0x1D, (uint8_t)clamp_u8_range(ccw_slope, 1, 64));
+}
+
+static esp_err_t restore_known_runtime_defaults(uint8_t id)
+{
+    ESP_RETURN_ON_ERROR(set_led(id, 0), TAG, "restore led failed");
+    ESP_RETURN_ON_ERROR(set_torque_limit_value(id, 1023), TAG, "restore torque limit failed");
+    return set_compliance(id, 1, 1, 32, 32);
+}
+
 static void execute_command(const char *cmd)
 {
     char op[24] = {0};
     int id = 0;
     int a = 0;
     int b = 0;
+    int c = 0;
+    int d = 0;
 
     strncpy(s_last_command, cmd, sizeof(s_last_command) - 1);
     s_last_command[sizeof(s_last_command) - 1] = '\0';
@@ -263,12 +404,17 @@ static void execute_command(const char *cmd)
     }
 
     if (strcmp(op, "HELP") == 0) {
-        status_set("OK cmds: GET PAIR HOME EDGE SET TORQUE RELAX CAPTURE_HOME PING");
+        status_set("OK cmds: GET CFG LED TL COMP RESTORE_RUNTIME PAIR HOME EDGE SET TORQUE RELAX CAPTURE_HOME PING");
         return;
     }
 
     if (strcmp(op, "GET") == 0 || strcmp(op, "READ") == 0) {
         status_snapshot();
+        return;
+    }
+
+    if (strcmp(op, "CFG") == 0 && sscanf(cmd, "%23s %d", op, &id) == 2) {
+        status_config((uint8_t)id);
         return;
     }
 
@@ -349,6 +495,46 @@ static void execute_command(const char *cmd)
             status_snapshot();
         } else {
             status_set("ERR TORQUE id=%d %s", id, esp_err_to_name(err));
+        }
+        return;
+    }
+
+    if (strcmp(op, "LED") == 0 && sscanf(cmd, "%23s %d %d", op, &id, &a) == 3) {
+        esp_err_t err = set_led((uint8_t)id, a);
+        if (err == ESP_OK) {
+            status_config((uint8_t)id);
+        } else {
+            status_set("ERR LED id=%d %s", id, esp_err_to_name(err));
+        }
+        return;
+    }
+
+    if (strcmp(op, "TL") == 0 && sscanf(cmd, "%23s %d %d", op, &id, &a) == 3) {
+        esp_err_t err = set_torque_limit_value((uint8_t)id, a);
+        if (err == ESP_OK) {
+            status_config((uint8_t)id);
+        } else {
+            status_set("ERR TL id=%d %s", id, esp_err_to_name(err));
+        }
+        return;
+    }
+
+    if (strcmp(op, "COMP") == 0 && sscanf(cmd, "%23s %d %d %d %d %d", op, &id, &a, &b, &c, &d) == 6) {
+        esp_err_t err = set_compliance((uint8_t)id, a, b, c, d);
+        if (err == ESP_OK) {
+            status_config((uint8_t)id);
+        } else {
+            status_set("ERR COMP id=%d %s", id, esp_err_to_name(err));
+        }
+        return;
+    }
+
+    if (strcmp(op, "RESTORE_RUNTIME") == 0 && sscanf(cmd, "%23s %d", op, &id) == 2) {
+        esp_err_t err = restore_known_runtime_defaults((uint8_t)id);
+        if (err == ESP_OK) {
+            status_config((uint8_t)id);
+        } else {
+            status_set("ERR RESTORE_RUNTIME id=%d %s", id, esp_err_to_name(err));
         }
         return;
     }

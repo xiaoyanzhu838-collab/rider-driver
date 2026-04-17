@@ -46,10 +46,49 @@
 
 - model = `12`
 - firmware = `28`
+- ID = `12 / 22`
+- baud code = `1`
+- status return level = `2`
 - return delay = `250`
 - angle range table 读出来是 `0 .. 1023`
+- temp limit = `85`
+- min / max voltage raw = `60 / 190`
+- max torque = `1023`
+- alarm LED mask = `0x24`
+- shutdown mask = `0x24`
+- compliance margin / slope = `1 / 1 / 32 / 32`
+- torque limit = `1023`
+- LED 缺省值 = `0`
+- lock = `0`
+- `0x30..0x31` 当前读到 `0x0000`
 
 这说明当前位置值可以按 `0~1023` 量级去理解。
+
+## 3.1 本轮新增确认的寄存器与协议行为
+
+今天又补实测确认了下面这些点：
+
+| 项目 | 地址 / 指令 | 结论 |
+| --- | --- | --- |
+| LED | `0x19` | 可直接 `WRITE`，写 `1` 后可读回 `1`，恢复 `0` 后可读回 `0` |
+| Registered Instruction | `0x2C` | 平时为 `0`；`REG_WRITE` 后变 `1`；`ACTION` 后回到 `0` |
+| Torque Limit | `0x22..0x23` | 不是假象，确认可写；`1023 -> 512 -> 1023` 可稳定读回 |
+| Compliance Margin | `0x1A..0x1B` | 可写；`1 -> 2 -> 1` 可稳定读回 |
+| Compliance Slope | `0x1C..0x1D` | 可写；`32 -> 16 -> 32` 可稳定读回 |
+| `REG_WRITE + ACTION` | `0x04 + 0x05` | 语义完全符合 Protocol 1.0：预写不立即生效，`ACTION` 广播后统一执行 |
+
+`REG_WRITE + ACTION` 的关键实测序列：
+
+- `LED baseline = 0`
+- `Registered baseline = 0`
+- `REG_WRITE LED=1` 后：
+  - `LED` 仍然是 `0`
+  - `Registered Instruction = 1`
+- `ACTION` 广播后：
+  - `LED = 1`
+  - `Registered Instruction = 0`
+
+这说明这两个电机不只是“像 AX 风格”，而是这部分协议行为已经被实测坐实。
 
 ## 4. 当前已验证的机械安全范围
 
@@ -214,6 +253,17 @@ goal22 = 439 + round(112 * percent / 100)
 - 如果要继续往极限附近试探，建议单步、小速度、短时间，并实时看位置反馈。
 - 不建议在上电自启动里直接跑极限测试逻辑。
 - 目前更适合把这两个电机当成“已知安全区间内可控”的总线执行器来使用。
+- 当前仍未做高风险写验证的项目：
+  - `0x06..0x09` 角度限制写回
+  - `0x03` ID
+  - `0x04` Baud Rate
+  - `0x2F` Lock
+  - `RESET / RECOVERY`
+
+建议后续顺序：
+
+1. 如果继续探索，先做“角度限制只在小范围内改写并立即恢复”的受控实验
+2. `ID / Baud / Lock / Reset` 继续保持最后再碰
 
 ## 13. 相关文件
 
@@ -227,6 +277,12 @@ goal22 = 439 + round(112 * percent / 100)
 
 - `C:\Users\user\.codex\memories\yah-pi-servo-12-22-boundary-progress-2026-04-17.md`
 - `C:\Users\user\.codex\memories\yah-pi-bot-one-ble-app-and-servo-control-status-2026-04-17.md`
+
+本轮寄存器 / 协议探索日志：
+
+- `D:\workspace\code\rider_driver\logs\motor_explore_2026-04-17.log`
+- `D:\workspace\code\rider_driver\logs\motor_explore_2026-04-17_torque-limit.log`
+- `D:\workspace\code\rider_driver\logs\motor_explore_2026-04-17_compliance.log`
 
 ## 14. 一句话结论
 

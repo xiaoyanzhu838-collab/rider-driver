@@ -25,3 +25,17 @@
  * @param arg  FreeRTOS 任务参数（未使用）
  */
 void motor_test_task(void *arg);
+
+/**
+ * @brief 低风险寄存器/协议探索任务
+ *
+ * 上电后只执行一次，优先验证：
+ * - 已识别但未系统整理的只读寄存器
+ * - LED (0x19) 的直接读写
+ * - REG_WRITE + ACTION 的延迟执行语义
+ *
+ * 任务完成后自动退出，不进入持续循环。
+ *
+ * @param arg FreeRTOS 任务参数（未使用）
+ */
+void motor_explore_task(void *arg);

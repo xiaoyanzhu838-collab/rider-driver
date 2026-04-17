@@ -38,6 +38,7 @@ static const char *TAG = "motor_test";
 // 需要测试的舵机 ID 列表
 static const uint8_t TARGET_IDS[] = { 12, 22 };
 #define TARGET_COUNT (sizeof(TARGET_IDS) / sizeof(TARGET_IDS[0]))
+#define EXPLORATION_SETTLE_MS 120
 
 // ============================================================
 // 电机型号识别（Profile Detection）
@@ -1532,4 +1533,275 @@ void motor_test_task(void *arg)
         }
     }
 #endif
+}
+
+static void log_read_u8(uint8_t id, uint8_t addr, const char *label)
+{
+    uint8_t value = 0;
+    esp_err_t err = scs_read_byte(id, addr, &value);
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "EXP ID=%u %-18s addr=0x%02X -> 0x%02X (%u)", id, label, addr, value, value);
+    } else {
+        ESP_LOGW(TAG, "EXP ID=%u %-18s addr=0x%02X read failed: %s",
+                 id, label, addr, esp_err_to_name(err));
+    }
+}
+
+static void log_read_u16(uint8_t id, uint8_t addr, const char *label)
+{
+    uint16_t value = 0;
+    esp_err_t err = scs_read_word(id, addr, &value);
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "EXP ID=%u %-18s addr=0x%02X -> 0x%04X (%u)", id, label, addr, value, value);
+    } else {
+        ESP_LOGW(TAG, "EXP ID=%u %-18s addr=0x%02X read failed: %s",
+                 id, label, addr, esp_err_to_name(err));
+    }
+}
+
+static void explore_read_candidates(uint8_t id)
+{
+    ESP_LOGI(TAG, "===== LOW-RISK READ EXPLORATION ID=%u =====", id);
+    log_read_u8(id, SCS_ADDR_ID, "ID");
+    log_read_u8(id, SCS_ADDR_BAUD_RATE, "BaudCode");
+    log_read_u8(id, SCS_ADDR_RETURN_DELAY, "ReturnDelay");
+    log_read_u16(id, SCS_ADDR_MIN_ANGLE_L, "MinAngle");
+    log_read_u16(id, SCS_ADDR_MAX_ANGLE_L, "MaxAngle");
+    log_read_u8(id, 0x0B, "TempLimit");
+    log_read_u8(id, 0x0C, "MinVoltRaw");
+    log_read_u8(id, 0x0D, "MaxVoltRaw");
+    log_read_u16(id, 0x0E, "MaxTorque");
+    log_read_u8(id, 0x10, "StatusRetLvl");
+    log_read_u8(id, 0x11, "AlarmLED");
+    log_read_u8(id, 0x12, "Shutdown");
+    log_read_u8(id, 0x19, "LED");
+    log_read_u8(id, 0x1A, "CWMargin");
+    log_read_u8(id, 0x1B, "CCWMargin");
+    log_read_u8(id, 0x1C, "CWSlope");
+    log_read_u8(id, 0x1D, "CCWSlope");
+    log_read_u16(id, 0x22, "TorqueLimit");
+    log_read_u16(id, 0x2C, "CurrentLike");
+    log_read_u8(id, 0x2E, "Moving");
+    log_read_u8(id, 0x2F, "Lock");
+    log_read_u16(id, 0x30, "PunchLike");
+}
+
+static bool read_byte_expect(uint8_t id, uint8_t addr, uint8_t *out, const char *label)
+{
+    esp_err_t err = scs_read_byte(id, addr, out);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "EXP ID=%u %s read failed: %s", id, label, esp_err_to_name(err));
+        return false;
+    }
+    ESP_LOGI(TAG, "EXP ID=%u %s -> 0x%02X (%u)", id, label, *out, *out);
+    return true;
+}
+
+static void explore_led_write(uint8_t id)
+{
+    uint8_t led_before = 0;
+    uint8_t led_after = 0;
+
+    ESP_LOGI(TAG, "===== LOW-RISK WRITE EXPLORATION ID=%u LED direct write =====", id);
+    if (!read_byte_expect(id, 0x19, &led_before, "LED before")) {
+        return;
+    }
+
+    ESP_LOGI(TAG, "EXP ID=%u LED direct write -> 1", id);
+    if (scs_write_byte(id, 0x19, 1) != ESP_OK) {
+        ESP_LOGW(TAG, "EXP ID=%u LED write(1) failed", id);
+        return;
+    }
+    vTaskDelay(pdMS_TO_TICKS(EXPLORATION_SETTLE_MS));
+    (void)read_byte_expect(id, 0x19, &led_after, "LED after write=1");
+
+    ESP_LOGI(TAG, "EXP ID=%u LED direct write restore -> %u", id, led_before);
+    if (scs_write_byte(id, 0x19, led_before) != ESP_OK) {
+        ESP_LOGW(TAG, "EXP ID=%u LED restore failed", id);
+        return;
+    }
+    vTaskDelay(pdMS_TO_TICKS(EXPLORATION_SETTLE_MS));
+    (void)read_byte_expect(id, 0x19, &led_after, "LED after restore");
+}
+
+static void explore_reg_write_action_pair(void)
+{
+    uint8_t led_before[TARGET_COUNT] = {0};
+    uint8_t led_after_reg[TARGET_COUNT] = {0};
+    uint8_t led_after_action[TARGET_COUNT] = {0};
+    uint8_t reg_before[TARGET_COUNT] = {0};
+    uint8_t reg_after_reg[TARGET_COUNT] = {0};
+    uint8_t reg_after_action[TARGET_COUNT] = {0};
+
+    ESP_LOGI(TAG, "===== LOW-RISK PROTOCOL EXPLORATION REG_WRITE + ACTION =====");
+    for (int i = 0; i < TARGET_COUNT; i++) {
+        uint8_t id = TARGET_IDS[i];
+        (void)read_byte_expect(id, 0x19, &led_before[i], "LED baseline");
+        (void)read_byte_expect(id, 0x2C, &reg_before[i], "Registered baseline");
+    }
+
+    for (int i = 0; i < TARGET_COUNT; i++) {
+        uint8_t id = TARGET_IDS[i];
+        uint8_t params[2] = { 0x19, 1 };
+        scs_status_t st = {0};
+        esp_err_t err = scs_txrx(id, SCS_INST_REG_WRITE, params, sizeof(params), &st, 30);
+        ESP_LOGI(TAG, "EXP ID=%u REG_WRITE LED=1 -> %s err_bits=0x%02X",
+                 id, esp_err_to_name(err), (err == ESP_OK) ? st.error : 0xFF);
+        vTaskDelay(pdMS_TO_TICKS(40));
+    }
+
+    for (int i = 0; i < TARGET_COUNT; i++) {
+        uint8_t id = TARGET_IDS[i];
+        (void)read_byte_expect(id, 0x19, &led_after_reg[i], "LED after REG_WRITE");
+        (void)read_byte_expect(id, 0x2C, &reg_after_reg[i], "Registered after REG_WRITE");
+    }
+
+    {
+        esp_err_t err = scs_txrx(SCS_BROADCAST_ID, SCS_INST_ACTION, NULL, 0, NULL, 30);
+        ESP_LOGI(TAG, "EXP ACTION broadcast -> %s", esp_err_to_name(err));
+    }
+    vTaskDelay(pdMS_TO_TICKS(EXPLORATION_SETTLE_MS));
+
+    for (int i = 0; i < TARGET_COUNT; i++) {
+        uint8_t id = TARGET_IDS[i];
+        (void)read_byte_expect(id, 0x19, &led_after_action[i], "LED after ACTION");
+        (void)read_byte_expect(id, 0x2C, &reg_after_action[i], "Registered after ACTION");
+    }
+
+    for (int i = 0; i < TARGET_COUNT; i++) {
+        uint8_t id = TARGET_IDS[i];
+        ESP_LOGI(TAG,
+                 "EXP SUMMARY ID=%u regwrite_action led:%u->%u->%u registered:%u->%u->%u",
+                 id,
+                 led_before[i], led_after_reg[i], led_after_action[i],
+                 reg_before[i], reg_after_reg[i], reg_after_action[i]);
+        (void)scs_write_byte(id, 0x19, led_before[i]);
+    }
+    vTaskDelay(pdMS_TO_TICKS(EXPLORATION_SETTLE_MS));
+}
+
+static void explore_torque_limit_write(uint8_t id)
+{
+    uint16_t baseline = 0;
+    uint16_t restored = 0;
+    uint16_t after_test = 0;
+    uint16_t test_value = 0x0200;
+
+    ESP_LOGI(TAG, "===== MEDIUM-RISK WRITE EXPLORATION ID=%u TorqueLimit =====", id);
+    if (scs_read_word(id, 0x22, &baseline) != ESP_OK) {
+        ESP_LOGW(TAG, "EXP ID=%u TorqueLimit baseline read failed", id);
+        return;
+    }
+    if (baseline == test_value) {
+        test_value = 0x0180;
+    }
+    ESP_LOGI(TAG, "EXP ID=%u TorqueLimit baseline=%u test_value=%u", id, baseline, test_value);
+
+    if (scs_write_word(id, 0x22, test_value) != ESP_OK) {
+        ESP_LOGW(TAG, "EXP ID=%u TorqueLimit write(%u) failed", id, test_value);
+        return;
+    }
+    vTaskDelay(pdMS_TO_TICKS(EXPLORATION_SETTLE_MS));
+    if (scs_read_word(id, 0x22, &after_test) == ESP_OK) {
+        ESP_LOGI(TAG, "EXP ID=%u TorqueLimit after write -> %u", id, after_test);
+    } else {
+        ESP_LOGW(TAG, "EXP ID=%u TorqueLimit read after write failed", id);
+    }
+
+    if (scs_write_word(id, 0x22, baseline) != ESP_OK) {
+        ESP_LOGW(TAG, "EXP ID=%u TorqueLimit restore(%u) failed", id, baseline);
+        return;
+    }
+    vTaskDelay(pdMS_TO_TICKS(EXPLORATION_SETTLE_MS));
+    if (scs_read_word(id, 0x22, &restored) == ESP_OK) {
+        ESP_LOGI(TAG, "EXP ID=%u TorqueLimit after restore -> %u", id, restored);
+    } else {
+        ESP_LOGW(TAG, "EXP ID=%u TorqueLimit read after restore failed", id);
+    }
+}
+
+static void explore_compliance_write(uint8_t id)
+{
+    uint8_t baseline_margin_cw = 0;
+    uint8_t baseline_margin_ccw = 0;
+    uint8_t baseline_slope_cw = 0;
+    uint8_t baseline_slope_ccw = 0;
+    uint8_t readback = 0;
+
+    ESP_LOGI(TAG, "===== MEDIUM-RISK WRITE EXPLORATION ID=%u Compliance =====", id);
+    if (!read_byte_expect(id, 0x1A, &baseline_margin_cw, "CWMargin baseline") ||
+        !read_byte_expect(id, 0x1B, &baseline_margin_ccw, "CCWMargin baseline") ||
+        !read_byte_expect(id, 0x1C, &baseline_slope_cw, "CWSlope baseline") ||
+        !read_byte_expect(id, 0x1D, &baseline_slope_ccw, "CCWSlope baseline")) {
+        return;
+    }
+
+    (void)scs_write_byte(id, 0x1A, 2);
+    (void)scs_write_byte(id, 0x1B, 2);
+    (void)scs_write_byte(id, 0x1C, 16);
+    (void)scs_write_byte(id, 0x1D, 16);
+    vTaskDelay(pdMS_TO_TICKS(EXPLORATION_SETTLE_MS));
+    (void)read_byte_expect(id, 0x1A, &readback, "CWMargin after write");
+    (void)read_byte_expect(id, 0x1B, &readback, "CCWMargin after write");
+    (void)read_byte_expect(id, 0x1C, &readback, "CWSlope after write");
+    (void)read_byte_expect(id, 0x1D, &readback, "CCWSlope after write");
+
+    (void)scs_write_byte(id, 0x1A, baseline_margin_cw);
+    (void)scs_write_byte(id, 0x1B, baseline_margin_ccw);
+    (void)scs_write_byte(id, 0x1C, baseline_slope_cw);
+    (void)scs_write_byte(id, 0x1D, baseline_slope_ccw);
+    vTaskDelay(pdMS_TO_TICKS(EXPLORATION_SETTLE_MS));
+    (void)read_byte_expect(id, 0x1A, &readback, "CWMargin restored");
+    (void)read_byte_expect(id, 0x1B, &readback, "CCWMargin restored");
+    (void)read_byte_expect(id, 0x1C, &readback, "CWSlope restored");
+    (void)read_byte_expect(id, 0x1D, &readback, "CCWSlope restored");
+}
+
+void motor_explore_task(void *arg)
+{
+    (void)arg;
+
+    ESP_LOGI(TAG, "======================================");
+    ESP_LOGI(TAG, "  Motor low-risk exploration task");
+    ESP_LOGI(TAG, "  IDs: %u, %u", TARGET_IDS[0], TARGET_IDS[1]);
+    ESP_LOGI(TAG, "======================================");
+
+    esp_err_t err = motor_init();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "motor_init failed: %s", esp_err_to_name(err));
+        vTaskDelete(NULL);
+        return;
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(1500));
+
+    for (int i = 0; i < TARGET_COUNT; i++) {
+        uint8_t id = TARGET_IDS[i];
+        scs_status_t st = {0};
+        err = scs_ping(id, &st);
+        ESP_LOGI(TAG, "EXP PING ID=%u -> %s err_bits=0x%02X",
+                 id, esp_err_to_name(err), (err == ESP_OK) ? st.error : 0xFF);
+        vTaskDelay(pdMS_TO_TICKS(80));
+        explore_read_candidates(id);
+        vTaskDelay(pdMS_TO_TICKS(120));
+        explore_led_write(id);
+        vTaskDelay(pdMS_TO_TICKS(120));
+    }
+
+    explore_reg_write_action_pair();
+    vTaskDelay(pdMS_TO_TICKS(120));
+
+    for (int i = 0; i < TARGET_COUNT; i++) {
+        explore_torque_limit_write(TARGET_IDS[i]);
+        vTaskDelay(pdMS_TO_TICKS(120));
+    }
+    for (int i = 0; i < TARGET_COUNT; i++) {
+        explore_compliance_write(TARGET_IDS[i]);
+        vTaskDelay(pdMS_TO_TICKS(120));
+    }
+
+    ESP_LOGI(TAG, "======================================");
+    ESP_LOGI(TAG, "  Motor low-risk exploration COMPLETE");
+    ESP_LOGI(TAG, "======================================");
+    vTaskDelete(NULL);
 }
