@@ -75,9 +75,9 @@ void imu_app_task(void *arg)
 
 #if BOARD_IMU_DIAGNOSTIC_MODE
     static const imu_diag_phase_t diag_phases[] = {
-        {.name = "upright", .instruction = "HOLD UPRIGHT"},
-        {.name = "forward", .instruction = "LEAN FORWARD"},
-        {.name = "backward", .instruction = "LEAN BACKWARD"},
+        {.name = "upright", .instruction = "保持扶正"},
+        {.name = "forward", .instruction = "向前倾"},
+        {.name = "backward", .instruction = "向后倾"},
     };
     const int diag_phase_count = (int)(sizeof(diag_phases) / sizeof(diag_phases[0]));
     int diag_phase_index = 0;
@@ -87,7 +87,7 @@ void imu_app_task(void *arg)
     int64_t next_diag_log_us = 0;
 
     ESP_LOGI(TAG,
-             "IMU diagnostic mode: phases=upright 3s, forward 3s, backward 3s, prep=%dms",
+             "IMU 诊断模式：扶正 3 秒，前倾 3 秒，后倾 3 秒，每段准备 %d 毫秒",
              BOARD_IMU_DIAGNOSTIC_PREP_MS);
 #endif
 
@@ -127,9 +127,9 @@ void imu_app_task(void *arg)
 #if BOARD_IMU_DIAGNOSTIC_MODE
         if (diag_state_start_us == 0) {
             diag_state_start_us = s.ts_us;
-            ESP_LOGI(TAG, "diag ready");
+            ESP_LOGI(TAG, "诊断准备完成");
             ESP_LOGI(TAG,
-                     "prepare phase %d/%d: %s, starts in %d ms",
+                     "准备阶段 %d/%d：%s，%d 毫秒后开始",
                      diag_phase_index + 1,
                      diag_phase_count,
                      diag_phases[diag_phase_index].instruction,
@@ -145,7 +145,7 @@ void imu_app_task(void *arg)
                     diag_state_start_us = s.ts_us;
                     next_diag_log_us = s.ts_us;
                     ESP_LOGI(TAG,
-                             "capture phase %d/%d START: %s for %d ms",
+                             "采集阶段 %d/%d 开始：%s，持续 %d 毫秒",
                              diag_phase_index + 1,
                              diag_phase_count,
                              diag_phases[diag_phase_index].instruction,
@@ -180,7 +180,7 @@ void imu_app_task(void *arg)
 
                 if (elapsed_ms >= BOARD_IMU_DIAGNOSTIC_STAGE_MS) {
                     ESP_LOGI(TAG,
-                             "capture phase %d/%d DONE: %s",
+                             "采集阶段 %d/%d 完成：%s",
                              diag_phase_index + 1,
                              diag_phase_count,
                              diag_phases[diag_phase_index].name);
@@ -190,10 +190,10 @@ void imu_app_task(void *arg)
 
                     if (diag_phase_index >= diag_phase_count) {
                         diag_complete = true;
-                        ESP_LOGI(TAG, "diagnostic capture complete, logging stopped");
+                        ESP_LOGI(TAG, "诊断采集完成，日志输出已停止");
                     } else {
                         ESP_LOGI(TAG,
-                                 "prepare phase %d/%d: %s, starts in %d ms",
+                                 "准备阶段 %d/%d：%s，%d 毫秒后开始",
                                  diag_phase_index + 1,
                                  diag_phase_count,
                                  diag_phases[diag_phase_index].instruction,
