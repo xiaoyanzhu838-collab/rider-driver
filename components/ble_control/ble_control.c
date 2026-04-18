@@ -8,10 +8,13 @@
 #include "esp_check.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/portmacro.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
 #include "host/ble_gatt.h"
 #include "host/ble_hs.h"
+#include "balance_task.h"
+#include "board_config.h"
 #include "host/util/util.h"
 #include "motor_control.h"
 #include "nimble/nimble_port.h"
@@ -36,8 +39,8 @@ static const char *TAG = "ble_control";
 #define WHEEL_SAFE_OPEN_PERCENT 20
 #define WHEEL_HOLD_SPEED 10
 #define WHEEL_MAX_GOAL_SPEED 1064
-#define WHEEL_SIGNED_SPEED_LIMIT 140
-#define WHEEL_SIGNED_SPEED_RECOMMENDED 120
+#define WHEEL_SIGNED_SPEED_LIMIT BOARD_WHEEL_SPEED_LIMIT
+#define WHEEL_SIGNED_SPEED_RECOMMENDED BOARD_WHEEL_SPEED_RECOMMENDED
 
 static uint8_t s_own_addr_type;
 static bool s_ble_started = false;
@@ -47,6 +50,9 @@ static char s_last_command[BLE_MAX_TEXT_LEN] = "";
 static int s_home12 = 599;
 static int s_home22 = 439;
 static QueueHandle_t s_command_queue;
+static portMUX_TYPE s_stream_mux = portMUX_INITIALIZER_UNLOCKED;
+static bool s_balance_stream_enabled = false;
+static uint32_t s_balance_stream_interval_ms = 100;
 
 static const ble_uuid128_t s_service_uuid =
     BLE_UUID128_INIT(0x10, 0x32, 0x54, 0x76, 0x98, 0xba, 0xdc, 0xfe,
@@ -96,17 +102,32 @@ typedef struct {
     char text[BLE_MAX_TEXT_LEN];
 } ble_command_item_t;
 
+static void status_set_v(bool log_to_serial, const char *fmt, va_list args)
+{
+    vsnprintf(s_status_text, sizeof(s_status_text), fmt, args);
+
+    if (log_to_serial) {
+        ESP_LOGI(TAG, "%s", s_status_text);
+    }
+    if (s_status_handle != 0) {
+        ble_gatts_chr_updated(s_status_handle);
+    }
+}
+
 static void status_set(const char *fmt, ...)
 {
     va_list args;
     va_start(args, fmt);
-    vsnprintf(s_status_text, sizeof(s_status_text), fmt, args);
+    status_set_v(true, fmt, args);
     va_end(args);
+}
 
-    ESP_LOGI(TAG, "%s", s_status_text);
-    if (s_status_handle != 0) {
-        ble_gatts_chr_updated(s_status_handle);
-    }
+static void status_set_quiet(const char *fmt, ...)
+{
+    va_list args;
+    va_start(args, fmt);
+    status_set_v(false, fmt, args);
+    va_end(args);
 }
 
 static int gatt_write_text(struct os_mbuf *om, char *dst, uint16_t max_len)
@@ -118,6 +139,170 @@ static int gatt_write_text(struct os_mbuf *om, char *dst, uint16_t max_len)
     }
     dst[out_len] = '\0';
     return 0;
+}
+
+static uint32_t clamp_stream_interval_ms(uint32_t interval_ms)
+{
+    if (interval_ms < 50) {
+        return 50;
+    }
+    if (interval_ms > 1000) {
+        return 1000;
+    }
+    return interval_ms;
+}
+
+static void balance_stream_set(bool enabled, uint32_t interval_ms)
+{
+    portENTER_CRITICAL(&s_stream_mux);
+    s_balance_stream_enabled = enabled;
+    s_balance_stream_interval_ms = clamp_stream_interval_ms(interval_ms);
+    portEXIT_CRITICAL(&s_stream_mux);
+}
+
+static void balance_stream_get(bool *enabled_out, uint32_t *interval_ms_out)
+{
+    bool enabled = false;
+    uint32_t interval_ms = 100;
+
+    portENTER_CRITICAL(&s_stream_mux);
+    enabled = s_balance_stream_enabled;
+    interval_ms = s_balance_stream_interval_ms;
+    portEXIT_CRITICAL(&s_stream_mux);
+
+    if (enabled_out) {
+        *enabled_out = enabled;
+    }
+    if (interval_ms_out) {
+        *interval_ms_out = interval_ms;
+    }
+}
+
+static void status_balance_pid(void)
+{
+    balance_pid_config_t cfg = {0};
+    if (balance_get_pid_config(&cfg) != ESP_OK) {
+        status_set("ERR BGETPID read_failed");
+        return;
+    }
+
+    status_set(
+        "{\"kind\":\"pid\",\"kp\":%.4f,\"ki\":%.4f,\"kd\":%.4f,\"kw\":%.4f,"
+        "\"target\":%.3f,\"ilim\":%.3f,\"dlim\":%.3f,\"log\":%d}",
+        (double)cfg.kp,
+        (double)cfg.ki,
+        (double)cfg.kd,
+        (double)cfg.kw,
+        (double)cfg.target_deg,
+        (double)cfg.i_term_limit,
+        (double)cfg.d_term_limit,
+        balance_get_runtime_log_enabled() ? 1 : 0);
+}
+
+static void status_balance_runtime_cfg(void)
+{
+    balance_runtime_config_t cfg = {0};
+    if (balance_get_runtime_config(&cfg) != ESP_OK) {
+        status_set("ERR BGETCFG read_failed");
+        return;
+    }
+
+    status_set(
+        "{\"kind\":\"cfg_balance\",\"speed_limit\":%d,\"tilt_cutoff\":%.2f}",
+        cfg.speed_limit,
+        (double)cfg.tilt_cutoff_deg);
+}
+
+static void status_balance_telemetry(bool quiet)
+{
+    balance_telemetry_t tel = {0};
+    if (!balance_get_telemetry(&tel)) {
+        if (quiet) {
+            status_set_quiet("{\"kind\":\"telemetry\",\"ok\":0}");
+        } else {
+            status_set("{\"kind\":\"telemetry\",\"ok\":0}");
+        }
+        return;
+    }
+
+    if (quiet) {
+        status_set_quiet(
+            "{\"kind\":\"telemetry\",\"ok\":1,\"seq\":%lu,\"en\":%d,\"arm\":%d,\"guard\":%d,"
+            "\"theta\":%.3f,\"target\":%.3f,\"err\":%.3f,\"zero\":%.3f,"
+            "\"ax\":%.3f,\"ay\":%.3f,\"az\":%.3f,\"gx\":%.3f,\"gy\":%.3f,\"gz\":%.3f,"
+            "\"roll\":%.3f,\"pitch\":%.3f,\"yaw\":%.3f,"
+            "\"rate\":%.3f,\"p\":%.3f,\"i\":%.3f,\"d\":%.3f,\"w\":%.3f,"
+            "\"ws\":%.3f,\"raw\":%d,\"out\":%d,\"ff\":%d,\"yaw_out\":%d,"
+            "\"ls\":%d,\"rs\":%d}",
+            (unsigned long)tel.seq,
+            tel.enabled ? 1 : 0,
+            tel.armed ? 1 : 0,
+            tel.in_tilt_guard ? 1 : 0,
+            (double)tel.theta_fb_deg,
+            (double)tel.target_deg,
+            (double)tel.error_deg,
+            (double)tel.zero_deg,
+            (double)tel.imu.ax,
+            (double)tel.imu.ay,
+            (double)tel.imu.az,
+            (double)tel.imu.gx,
+            (double)tel.imu.gy,
+            (double)tel.imu.gz,
+            (double)tel.euler.roll,
+            (double)tel.euler.pitch,
+            (double)tel.euler.yaw,
+            (double)tel.rate_deg_s,
+            (double)tel.p_term,
+            (double)tel.i_term,
+            (double)tel.d_term,
+            (double)tel.w_term,
+            (double)tel.wheel_speed_feedback,
+            tel.raw_forward_speed,
+            tel.forward_speed,
+            tel.feedforward_speed,
+            tel.yaw_speed,
+            tel.wheel.left_speed,
+            tel.wheel.right_speed);
+        return;
+    }
+
+    status_set(
+        "{\"kind\":\"telemetry\",\"ok\":1,\"seq\":%lu,\"en\":%d,\"arm\":%d,\"guard\":%d,"
+        "\"theta\":%.3f,\"target\":%.3f,\"err\":%.3f,\"zero\":%.3f,"
+        "\"ax\":%.3f,\"ay\":%.3f,\"az\":%.3f,\"gx\":%.3f,\"gy\":%.3f,\"gz\":%.3f,"
+        "\"roll\":%.3f,\"pitch\":%.3f,\"yaw\":%.3f,"
+        "\"rate\":%.3f,\"p\":%.3f,\"i\":%.3f,\"d\":%.3f,\"w\":%.3f,"
+        "\"ws\":%.3f,\"raw\":%d,\"out\":%d,\"ff\":%d,\"yaw_out\":%d,"
+        "\"ls\":%d,\"rs\":%d}",
+        (unsigned long)tel.seq,
+        tel.enabled ? 1 : 0,
+        tel.armed ? 1 : 0,
+        tel.in_tilt_guard ? 1 : 0,
+        (double)tel.theta_fb_deg,
+        (double)tel.target_deg,
+        (double)tel.error_deg,
+        (double)tel.zero_deg,
+        (double)tel.imu.ax,
+        (double)tel.imu.ay,
+        (double)tel.imu.az,
+        (double)tel.imu.gx,
+        (double)tel.imu.gy,
+        (double)tel.imu.gz,
+        (double)tel.euler.roll,
+        (double)tel.euler.pitch,
+        (double)tel.euler.yaw,
+        (double)tel.rate_deg_s,
+        (double)tel.p_term,
+        (double)tel.i_term,
+        (double)tel.d_term,
+        (double)tel.w_term,
+        (double)tel.wheel_speed_feedback,
+        tel.raw_forward_speed,
+        tel.forward_speed,
+        tel.feedforward_speed,
+        tel.yaw_speed,
+        tel.wheel.left_speed,
+        tel.wheel.right_speed);
 }
 
 static bool is_supported_servo(uint8_t id)
@@ -838,7 +1023,105 @@ static void execute_command(const char *cmd)
     }
 
     if (strcmp(op, "HELP") == 0) {
-        status_set("OK cmds: GET WGET SCAN CFG LED TL COMP RESTORE_RUNTIME PAIR HOME EDGE SET TORQUE RELAX CAPTURE_HOME WSET(signed) WRAW WI16 WDXL WPROBE WSTOP WHOLD WRELAX PING");
+        status_set("OK cmds: GET WGET BGETPID BSETPID BGETCFG BSETCFG BGETTEL BTELE BLOG SCAN CFG LED TL COMP RESTORE_RUNTIME PAIR HOME EDGE SET TORQUE RELAX CAPTURE_HOME WSET(signed) WRAW WI16 WDXL WPROBE WSTOP WHOLD WRELAX PING");
+        return;
+    }
+
+    if (strcmp(op, "BGETPID") == 0) {
+        status_balance_pid();
+        return;
+    }
+
+    if (strcmp(op, "BGETTEL") == 0) {
+        status_balance_telemetry(false);
+        return;
+    }
+
+    if (strcmp(op, "BGETCFG") == 0) {
+        status_balance_runtime_cfg();
+        return;
+    }
+
+    if (strcmp(op, "BLOG") == 0 && sscanf(cmd, "%23s %d", op, &a) == 2) {
+        balance_set_runtime_log_enabled(a != 0);
+        status_set("{\"kind\":\"blog\",\"enabled\":%d}", a != 0 ? 1 : 0);
+        return;
+    }
+
+    if (strcmp(op, "BTELE") == 0) {
+        unsigned long interval_ms = 100;
+        int enabled = 0;
+        int matched = sscanf(cmd, "%23s %d %lu", op, &enabled, &interval_ms);
+        if (matched >= 2) {
+            balance_stream_set(enabled != 0, (uint32_t)interval_ms);
+            status_set("{\"kind\":\"btele\",\"enabled\":%d,\"interval_ms\":%lu}",
+                       enabled != 0 ? 1 : 0,
+                       (unsigned long)clamp_stream_interval_ms((uint32_t)interval_ms));
+            return;
+        }
+    }
+
+    if (strcmp(op, "BSETPID") == 0) {
+        balance_pid_config_t cfg = {0};
+        float kp = 0.0f;
+        float ki = 0.0f;
+        float kd = 0.0f;
+        float kw = 0.0f;
+        float target = 0.0f;
+        int matched = 0;
+
+        if (balance_get_pid_config(&cfg) != ESP_OK) {
+            status_set("ERR BSETPID read_failed");
+            return;
+        }
+
+        matched = sscanf(cmd, "%23s %f %f %f %f %f", op, &kp, &ki, &kd, &kw, &target);
+        if (matched < 4) {
+            status_set("ERR BSETPID need kp ki kd [kw] [target]");
+            return;
+        }
+
+        cfg.kp = kp;
+        cfg.ki = ki;
+        cfg.kd = kd;
+        if (matched >= 5) {
+            cfg.kw = kw;
+        }
+        if (matched >= 6) {
+            cfg.target_deg = target;
+        }
+
+        if (balance_set_pid_config(&cfg) != ESP_OK) {
+            status_set("ERR BSETPID write_failed");
+            return;
+        }
+        status_balance_pid();
+        return;
+    }
+
+    if (strcmp(op, "BSETCFG") == 0) {
+        balance_runtime_config_t cfg = {0};
+        int matched = 0;
+
+        if (balance_get_runtime_config(&cfg) != ESP_OK) {
+            status_set("ERR BSETCFG read_failed");
+            return;
+        }
+
+        matched = sscanf(cmd, "%23s %d %f",
+                         op,
+                         &cfg.speed_limit,
+                         &cfg.tilt_cutoff_deg);
+        if (matched < 3) {
+            status_set("ERR BSETCFG need speed_limit tilt_cutoff");
+            return;
+        }
+
+        if (balance_set_runtime_config(&cfg) != ESP_OK) {
+            status_set("ERR BSETCFG write_failed");
+            return;
+        }
+        status_balance_runtime_cfg();
         return;
     }
 
@@ -1098,6 +1381,24 @@ static void ble_command_task(void *arg)
     }
 }
 
+static void ble_balance_stream_task(void *arg)
+{
+    (void)arg;
+
+    while (1) {
+        bool enabled = false;
+        uint32_t interval_ms = 100;
+
+        balance_stream_get(&enabled, &interval_ms);
+        if (enabled) {
+            status_balance_telemetry(true);
+            vTaskDelay(pdMS_TO_TICKS(interval_ms));
+        } else {
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
+    }
+}
+
 static int ble_access_cb(uint16_t conn_handle, uint16_t attr_handle,
                          struct ble_gatt_access_ctxt *ctxt, void *arg)
 {
@@ -1297,6 +1598,11 @@ esp_err_t ble_control_init(void)
         return ESP_ERR_NO_MEM;
     }
     if (xTaskCreate(ble_command_task, "ble_cmd", 6144, NULL, 5, NULL) != pdPASS) {
+        vQueueDelete(s_command_queue);
+        s_command_queue = NULL;
+        return ESP_ERR_NO_MEM;
+    }
+    if (xTaskCreate(ble_balance_stream_task, "ble_btel", 4096, NULL, 4, NULL) != pdPASS) {
         vQueueDelete(s_command_queue);
         s_command_queue = NULL;
         return ESP_ERR_NO_MEM;

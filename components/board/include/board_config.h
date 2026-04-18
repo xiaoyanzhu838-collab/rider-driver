@@ -65,13 +65,13 @@
 #define BOARD_BODY_HEIGHT_MOVE_SPEED      (200)
 
 // Signed speed envelope confirmed on the wheel nodes.
-#define BOARD_WHEEL_SPEED_LIMIT    (140)
+#define BOARD_WHEEL_SPEED_LIMIT    (1000)
 #define BOARD_WHEEL_MIN_EFFECTIVE_SPEED (30)
 #define BOARD_WHEEL_BREAKAWAY_SPEED (60)
 #define BOARD_WHEEL_BREAKAWAY_HIGH_SPEED (80)
 #define BOARD_WHEEL_DIVERGE_BOOST_SPEED (80)
 #define BOARD_WHEEL_ARM_ASSIST_SPEED (50)
-#define BOARD_WHEEL_SPEED_RECOMMENDED (120)
+#define BOARD_WHEEL_SPEED_RECOMMENDED (1000)
 
 // Logical chassis wheel direction to raw wheel signed-speed mapping.
 // Keep these as board-level constants so field tuning only needs one edit.
@@ -82,7 +82,7 @@
 #define BOARD_CONTROL_INPUT_CENTER (128)
 #define BOARD_CONTROL_INPUT_DEADBAND (4)
 #define BOARD_BALANCE_LOOP_PERIOD_MS (10)
-#define BOARD_BALANCE_TILT_CUTOFF_DEG (35.0f)
+#define BOARD_BALANCE_TILT_CUTOFF_DEG (75.0f)
 #define BOARD_BALANCE_FORCE_ENABLE (1)
 #define BOARD_BALANCE_PITCH_TARGET_DEG (0.0f)
 #define BOARD_BALANCE_ARM_PITCH_DEG (6.0f)
@@ -106,7 +106,9 @@
 #define BOARD_BALANCE_OUTPUT_SIGN  (1.0f)
 #define BOARD_BALANCE_PITCH_RATE_SIGN (1.0f)
 #define BOARD_BALANCE_KP           (4.4f)
+#define BOARD_BALANCE_KI           (0.0f)
 #define BOARD_BALANCE_KD           (0.35f)
+#define BOARD_BALANCE_I_TERM_LIMIT (30.0f)
 #define BOARD_BALANCE_D_TERM_LIMIT (45.0f)
 #define BOARD_BALANCE_KW           (0.0f)
 #define BOARD_BALANCE_VX_MAX_SPEED (45)

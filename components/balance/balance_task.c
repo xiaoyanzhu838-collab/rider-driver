@@ -6,6 +6,7 @@
 
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/portmacro.h"
 #include "freertos/task.h"
 
 #include "ahrs.h"
@@ -16,6 +17,22 @@
 #include "wheel_control.h"
 
 static const char *TAG = "balance";
+static portMUX_TYPE s_runtime_mux = portMUX_INITIALIZER_UNLOCKED;
+static balance_pid_config_t s_pid_cfg = {
+    .kp = BOARD_BALANCE_KP,
+    .ki = BOARD_BALANCE_KI,
+    .kd = BOARD_BALANCE_KD,
+    .kw = BOARD_BALANCE_KW,
+    .target_deg = BOARD_BALANCE_PITCH_TARGET_DEG,
+    .i_term_limit = BOARD_BALANCE_I_TERM_LIMIT,
+    .d_term_limit = BOARD_BALANCE_D_TERM_LIMIT,
+};
+static balance_runtime_config_t s_runtime_cfg = {
+    .speed_limit = BOARD_WHEEL_SPEED_LIMIT,
+    .tilt_cutoff_deg = BOARD_BALANCE_TILT_CUTOFF_DEG,
+};
+static balance_telemetry_t s_telemetry = {0};
+static bool s_runtime_log_enabled = false;
 
 static int clamp_range(int value, int limit)
 {
@@ -37,6 +54,111 @@ static float clampf_range(float value, float limit)
         return limit;
     }
     return value;
+}
+
+esp_err_t balance_get_pid_config(balance_pid_config_t *out)
+{
+    if (!out) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    portENTER_CRITICAL(&s_runtime_mux);
+    *out = s_pid_cfg;
+    portEXIT_CRITICAL(&s_runtime_mux);
+    return ESP_OK;
+}
+
+esp_err_t balance_set_pid_config(const balance_pid_config_t *cfg)
+{
+    if (!cfg) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    portENTER_CRITICAL(&s_runtime_mux);
+    s_pid_cfg.kp = clampf_range(cfg->kp, 200.0f);
+    if (s_pid_cfg.kp < 0.0f) {
+        s_pid_cfg.kp = 0.0f;
+    }
+    s_pid_cfg.ki = clampf_range(cfg->ki, 200.0f);
+    if (s_pid_cfg.ki < 0.0f) {
+        s_pid_cfg.ki = 0.0f;
+    }
+    s_pid_cfg.kd = clampf_range(cfg->kd, 100.0f);
+    if (s_pid_cfg.kd < 0.0f) {
+        s_pid_cfg.kd = 0.0f;
+    }
+    s_pid_cfg.kw = clampf_range(cfg->kw, 20.0f);
+    s_pid_cfg.target_deg = clampf_range(cfg->target_deg, 15.0f);
+    s_pid_cfg.i_term_limit = clampf_range(cfg->i_term_limit, 200.0f);
+    if (s_pid_cfg.i_term_limit < 0.0f) {
+        s_pid_cfg.i_term_limit = 0.0f;
+    }
+    s_pid_cfg.d_term_limit = clampf_range(cfg->d_term_limit, 200.0f);
+    if (s_pid_cfg.d_term_limit < 0.0f) {
+        s_pid_cfg.d_term_limit = 0.0f;
+    }
+    portEXIT_CRITICAL(&s_runtime_mux);
+    return ESP_OK;
+}
+
+esp_err_t balance_get_runtime_config(balance_runtime_config_t *out)
+{
+    if (!out) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    portENTER_CRITICAL(&s_runtime_mux);
+    *out = s_runtime_cfg;
+    portEXIT_CRITICAL(&s_runtime_mux);
+    return ESP_OK;
+}
+
+esp_err_t balance_set_runtime_config(const balance_runtime_config_t *cfg)
+{
+    if (!cfg) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    portENTER_CRITICAL(&s_runtime_mux);
+    s_runtime_cfg.speed_limit = clamp_range(cfg->speed_limit, BOARD_WHEEL_SPEED_LIMIT);
+    if (s_runtime_cfg.speed_limit < 1) {
+        s_runtime_cfg.speed_limit = 1;
+    }
+    s_runtime_cfg.tilt_cutoff_deg = clampf_range(cfg->tilt_cutoff_deg, 89.0f);
+    if (s_runtime_cfg.tilt_cutoff_deg < 20.0f) {
+        s_runtime_cfg.tilt_cutoff_deg = 20.0f;
+    }
+    portEXIT_CRITICAL(&s_runtime_mux);
+    return ESP_OK;
+}
+
+bool balance_get_telemetry(balance_telemetry_t *out)
+{
+    if (!out) {
+        return false;
+    }
+
+    portENTER_CRITICAL(&s_runtime_mux);
+    *out = s_telemetry;
+    portEXIT_CRITICAL(&s_runtime_mux);
+    return true;
+}
+
+void balance_set_runtime_log_enabled(bool enabled)
+{
+    portENTER_CRITICAL(&s_runtime_mux);
+    s_runtime_log_enabled = enabled;
+    portEXIT_CRITICAL(&s_runtime_mux);
+}
+
+bool balance_get_runtime_log_enabled(void)
+{
+    bool enabled = false;
+
+    portENTER_CRITICAL(&s_runtime_mux);
+    enabled = s_runtime_log_enabled;
+    portEXIT_CRITICAL(&s_runtime_mux);
+    return enabled;
 }
 
 static int map_centered_u8_to_speed(uint8_t raw, int max_abs)
@@ -65,138 +187,6 @@ static float compute_fore_aft_tilt_deg(const imu_sample_t *sample)
     //   +Y front, +X right, +Z up.
     // Fore-aft balance is rotation about X, so use the gravity vector on the Y/Z plane.
     return atan2f(-sample->ay, sample->az) * 57.29577951f;
-}
-
-static int apply_min_effective_speed(int value, int min_effective)
-{
-    if (value == 0 || min_effective <= 0) {
-        return value;
-    }
-
-    if (value > 0 && value < min_effective) {
-        return min_effective;
-    }
-    if (value < 0 && value > -min_effective) {
-        return -min_effective;
-    }
-    return value;
-}
-
-static int apply_breakaway_speed(int value,
-                                 int min_effective,
-                                 int breakaway_speed,
-                                 float pitch_error_deg,
-                                 float wheel_speed_feedback)
-{
-    int floor_speed = min_effective;
-
-    if (fabsf(wheel_speed_feedback) < BOARD_BALANCE_STICTION_SPEED_THRESHOLD) {
-        if (fabsf(pitch_error_deg) >= BOARD_BALANCE_STICTION_HIGH_PITCH_DEG &&
-            BOARD_WHEEL_BREAKAWAY_HIGH_SPEED > floor_speed) {
-            floor_speed = BOARD_WHEEL_BREAKAWAY_HIGH_SPEED;
-        } else if (fabsf(pitch_error_deg) >= BOARD_BALANCE_STICTION_PITCH_DEG &&
-                   breakaway_speed > floor_speed) {
-            floor_speed = breakaway_speed;
-        }
-    }
-
-    return apply_min_effective_speed(value, floor_speed);
-}
-
-static int apply_diverge_boost(int value,
-                               float pitch_error_deg,
-                               float pitch_rate_deg_s,
-                               float wheel_speed_feedback)
-{
-    if (value == 0) {
-        return value;
-    }
-
-    if (fabsf(pitch_error_deg) < BOARD_BALANCE_DIVERGE_PITCH_DEG ||
-        fabsf(pitch_rate_deg_s) < BOARD_BALANCE_DIVERGE_RATE_DPS) {
-        return value;
-    }
-
-    if ((pitch_error_deg * pitch_rate_deg_s) <= 0.0f) {
-        return value;
-    }
-
-    if (fabsf(wheel_speed_feedback) >= (BOARD_BALANCE_STICTION_SPEED_THRESHOLD * 2.0f)) {
-        return value;
-    }
-
-    return apply_min_effective_speed(value, BOARD_WHEEL_DIVERGE_BOOST_SPEED);
-}
-
-static int apply_arm_assist(int value,
-                            float pitch_error_deg,
-                            float pitch_rate_deg_s,
-                            float wheel_speed_feedback,
-                            TickType_t now,
-                            TickType_t arm_tick)
-{
-    if (value == 0 || arm_tick == 0) {
-        return value;
-    }
-
-    if ((now - arm_tick) > pdMS_TO_TICKS(BOARD_BALANCE_ARM_ASSIST_MS)) {
-        return value;
-    }
-
-    if (fabsf(pitch_error_deg) < BOARD_BALANCE_ARM_ASSIST_PITCH_DEG ||
-        fabsf(pitch_rate_deg_s) < BOARD_BALANCE_ARM_ASSIST_RATE_DPS) {
-        return value;
-    }
-
-    if ((pitch_error_deg * pitch_rate_deg_s) <= 0.0f) {
-        return value;
-    }
-
-    if (fabsf(wheel_speed_feedback) >= BOARD_BALANCE_STICTION_SPEED_THRESHOLD) {
-        return value;
-    }
-
-    return apply_min_effective_speed(value, BOARD_WHEEL_ARM_ASSIST_SPEED);
-}
-
-static int apply_arm_softstart(int value,
-                               float pitch_error_deg,
-                               TickType_t now,
-                               TickType_t arm_tick)
-{
-    if (value == 0 || arm_tick == 0) {
-        return value;
-    }
-
-    if ((now - arm_tick) > pdMS_TO_TICKS(BOARD_BALANCE_SOFTSTART_MS)) {
-        return value;
-    }
-
-    if (fabsf(pitch_error_deg) >= BOARD_BALANCE_SOFTSTART_PITCH_DEG) {
-        return value;
-    }
-
-    return clamp_range(value, BOARD_BALANCE_SOFTSTART_SPEED);
-}
-
-static float soften_counter_d_term(float p_term, float d_term, float pitch_error_deg)
-{
-    const float protect_error_deg = 4.0f;
-    const float counter_ratio_limit = 0.6f;
-
-    if (fabsf(pitch_error_deg) < protect_error_deg) {
-        return d_term;
-    }
-
-    if ((p_term * d_term) >= 0.0f) {
-        return d_term;
-    }
-
-    if (fabsf(d_term) <= (fabsf(p_term) * counter_ratio_limit)) {
-        return d_term;
-    }
-
-    return copysignf(fabsf(p_term) * counter_ratio_limit, d_term);
 }
 
 static int decode_signed_u16(uint16_t value)
@@ -276,11 +266,11 @@ void balance_task(void *arg)
     TickType_t last_idle_log_tick = 0;
     TickType_t last_body_pose_retry_tick = 0;
     TickType_t arm_candidate_tick = 0;
-    TickType_t balance_arm_tick = 0;
     TickType_t wheel_probe_start_tick = 0;
     float arm_theta_sum_deg = 0.0f;
     int arm_theta_samples = 0;
     float pitch_rate_deg_s = 0.0f;
+    float error_integral = 0.0f;
     float wheel_speed_feedback = 0.0f;
     float balance_zero_deg = 0.0f;
     TickType_t last_wheel_feedback_tick = 0;
@@ -308,6 +298,7 @@ void balance_task(void *arg)
         ahrs_euler_t euler = {0};
         bool balance_enabled = false;
         TickType_t now = xTaskGetTickCount();
+        bool runtime_logs_enabled = balance_get_runtime_log_enabled();
 
         proto_get_write_state(&proto);
         balance_enabled = BOARD_BALANCE_FORCE_ENABLE || (proto.imu_balance != 0);
@@ -322,6 +313,17 @@ void balance_task(void *arg)
         }
 
         ahrs_get_euler(&euler);
+        {
+            portENTER_CRITICAL(&s_runtime_mux);
+            s_telemetry.enabled = balance_enabled;
+            s_telemetry.armed = balance_armed;
+            s_telemetry.in_tilt_guard = in_tilt_guard;
+            s_telemetry.zero_captured = balance_zero_captured;
+            s_telemetry.zero_deg = balance_zero_deg;
+            s_telemetry.imu = sample;
+            s_telemetry.euler = euler;
+            portEXIT_CRITICAL(&s_runtime_mux);
+        }
 
         if (!body_pose_initialized) {
             if (last_body_pose_retry_tick == 0 ||
@@ -409,7 +411,8 @@ void balance_task(void *arg)
                 ESP_LOGI(TAG, "balance disabled, wheels stopped");
             }
 
-            if ((now - last_idle_log_tick) >= pdMS_TO_TICKS(2000)) {
+            if (runtime_logs_enabled &&
+                (now - last_idle_log_tick) >= pdMS_TO_TICKS(2000)) {
                 const float acc_norm = vector_norm3(sample.ax, sample.ay, sample.az);
                 const float gyro_norm = vector_norm3(sample.gx, sample.gy, sample.gz);
                 const float theta_fb_deg = compute_fore_aft_tilt_deg(&sample);
@@ -433,10 +436,10 @@ void balance_task(void *arg)
             in_tilt_guard = false;
             balance_armed = false;
             balance_zero_captured = false;
-            balance_arm_tick = 0;
             arm_theta_sum_deg = 0.0f;
             arm_theta_samples = 0;
             pitch_rate_deg_s = 0.0f;
+            error_integral = 0.0f;
             wheel_speed_feedback = 0.0f;
             wheel_feedback_valid = false;
             arm_candidate_tick = 0;
@@ -447,10 +450,10 @@ void balance_task(void *arg)
         if (!was_enabled) {
             balance_armed = false;
             balance_zero_captured = false;
-            balance_arm_tick = 0;
             arm_theta_sum_deg = 0.0f;
             arm_theta_samples = 0;
             pitch_rate_deg_s = 0.0f;
+            error_integral = 0.0f;
             wheel_speed_feedback = 0.0f;
             wheel_feedback_valid = false;
             last_wheel_feedback_tick = 0;
@@ -489,8 +492,8 @@ void balance_task(void *arg)
                     balance_zero_deg = clampf_range(avg_theta_deg,
                                                     BOARD_BALANCE_ZERO_CAPTURE_LIMIT_DEG);
                     balance_zero_captured = true;
-                    balance_arm_tick = now;
                     pitch_rate_deg_s = 0.0f;
+                    error_integral = 0.0f;
                     wheel_speed_feedback = 0.0f;
                     wheel_feedback_valid = false;
                     last_wheel_feedback_tick = 0;
@@ -505,7 +508,8 @@ void balance_task(void *arg)
                 arm_candidate_tick = 0;
                 arm_theta_sum_deg = 0.0f;
                 arm_theta_samples = 0;
-                if ((now - last_log_tick) >= pdMS_TO_TICKS(500)) {
+                if (runtime_logs_enabled &&
+                    (now - last_log_tick) >= pdMS_TO_TICKS(500)) {
                     ESP_LOGI(TAG,
                              "arm_wait: theta_fb=%.2f gx=%.2f need |theta|<=%.1f |rate|<=%.1f",
                              (double)compute_fore_aft_tilt_deg(&sample),
@@ -521,15 +525,17 @@ void balance_task(void *arg)
         }
 
         {
+            balance_pid_config_t pid_cfg = {0};
+            balance_runtime_config_t runtime_cfg = {0};
             const float theta_fb_deg = compute_fore_aft_tilt_deg(&sample);
-            const float balance_target_deg =
-                (balance_zero_captured ? balance_zero_deg : 0.0f) + BOARD_BALANCE_PITCH_TARGET_DEG;
-            const float pitch_error_deg = theta_fb_deg - balance_target_deg;
+            float balance_target_deg = 0.0f;
+            float pitch_error_deg = 0.0f;
             const float raw_pitch_rate_deg_s = -sample.gx;
             const int feedforward_speed = map_centered_u8_to_speed(proto.vx, BOARD_BALANCE_VX_MAX_SPEED);
             const int yaw_speed = map_centered_u8_to_speed(proto.vyaw, BOARD_BALANCE_VYAW_MAX_SPEED);
             float control_f = 0.0f;
             float p_term = 0.0f;
+            float i_term = 0.0f;
             float d_term = 0.0f;
             float w_term = 0.0f;
             int raw_forward_speed = 0;
@@ -538,6 +544,12 @@ void balance_task(void *arg)
             int left_wheel_speed = 0;
             int right_wheel_speed = 0;
             int avg_wheel_speed = 0;
+
+            (void)balance_get_pid_config(&pid_cfg);
+            (void)balance_get_runtime_config(&runtime_cfg);
+            balance_target_deg =
+                (balance_zero_captured ? balance_zero_deg : 0.0f) + pid_cfg.target_deg;
+            pitch_error_deg = theta_fb_deg - balance_target_deg;
 
             // Use near-real-time gyro damping here; a heavily lagged D term was
             // pushing through the upright crossing and amplifying overshoot.
@@ -554,18 +566,19 @@ void balance_task(void *arg)
                 last_wheel_feedback_tick = now;
             }
 
-            if (fabsf(pitch_error_deg) > BOARD_BALANCE_TILT_CUTOFF_DEG) {
+            if (fabsf(pitch_error_deg) > runtime_cfg.tilt_cutoff_deg) {
                 err = wheel_control_stop();
                 if (!in_tilt_guard) {
-                    ESP_LOGW(TAG, "tilt guard active, theta_fb=%.2f deg", (double)pitch_error_deg);
+                    ESP_LOGW(TAG, "tilt guard active, theta_fb=%.2f deg cutoff=%.2f deg",
+                             (double)pitch_error_deg, (double)runtime_cfg.tilt_cutoff_deg);
                 }
                 in_tilt_guard = true;
                 balance_armed = false;
                 arm_candidate_tick = 0;
-                balance_arm_tick = 0;
                 arm_theta_sum_deg = 0.0f;
                 arm_theta_samples = 0;
                 pitch_rate_deg_s = 0.0f;
+                error_integral = 0.0f;
                 wheel_speed_feedback = 0.0f;
                 wheel_feedback_valid = false;
                 last_wheel_feedback_tick = 0;
@@ -583,37 +596,53 @@ void balance_task(void *arg)
                 fabsf(pitch_rate_deg_s) < BOARD_BALANCE_RATE_DEADBAND_DPS &&
                 feedforward_speed == 0) {
                 control_f = 0.0f;
+                error_integral *= 0.9f;
             } else {
-                p_term = BOARD_BALANCE_KP * pitch_error_deg;
-                d_term = clampf_range(BOARD_BALANCE_KD * pitch_rate_deg_s,
-                                      BOARD_BALANCE_D_TERM_LIMIT);
-                d_term = soften_counter_d_term(p_term, d_term, pitch_error_deg);
-                w_term = wheel_feedback_valid ? (BOARD_BALANCE_KW * wheel_speed_feedback) : 0.0f;
+                const float dt_s = (float)BOARD_BALANCE_LOOP_PERIOD_MS / 1000.0f;
+                error_integral += pitch_error_deg * dt_s;
+                error_integral = clampf_range(error_integral, pid_cfg.i_term_limit);
+                p_term = pid_cfg.kp * pitch_error_deg;
+                i_term = pid_cfg.ki * error_integral;
+                d_term = clampf_range(pid_cfg.kd * pitch_rate_deg_s,
+                                      pid_cfg.d_term_limit);
+                w_term = 0.0f;
                 control_f = BOARD_BALANCE_OUTPUT_SIGN *
-                            (p_term + d_term + w_term);
+                            (p_term + i_term + d_term);
             }
 
             raw_forward_speed = clamp_range((int)lroundf(control_f) + feedforward_speed,
-                                            BOARD_WHEEL_SPEED_LIMIT);
-            forward_speed = apply_breakaway_speed(raw_forward_speed,
-                                                  BOARD_WHEEL_MIN_EFFECTIVE_SPEED,
-                                                  BOARD_WHEEL_BREAKAWAY_SPEED,
-                                                  pitch_error_deg,
-                                                  wheel_speed_feedback);
-            forward_speed = apply_diverge_boost(forward_speed,
-                                                pitch_error_deg,
-                                                pitch_rate_deg_s,
-                                                wheel_speed_feedback);
-            forward_speed = apply_arm_assist(forward_speed,
-                                             pitch_error_deg,
-                                             pitch_rate_deg_s,
-                                             wheel_speed_feedback,
-                                             now,
-                                             balance_arm_tick);
-            forward_speed = apply_arm_softstart(forward_speed,
-                                                pitch_error_deg,
-                                                now,
-                                                balance_arm_tick);
+                                            runtime_cfg.speed_limit);
+            forward_speed = raw_forward_speed;
+            {
+                wheel_control_state_t wheel_state = {0};
+                (void)wheel_control_get_state(&wheel_state);
+                portENTER_CRITICAL(&s_runtime_mux);
+                s_telemetry.seq += 1;
+                s_telemetry.enabled = balance_enabled;
+                s_telemetry.armed = balance_armed;
+                s_telemetry.in_tilt_guard = in_tilt_guard;
+                s_telemetry.zero_captured = balance_zero_captured;
+                s_telemetry.wheel_feedback_valid = wheel_feedback_valid;
+                s_telemetry.theta_fb_deg = theta_fb_deg;
+                s_telemetry.target_deg = balance_target_deg;
+                s_telemetry.error_deg = pitch_error_deg;
+                s_telemetry.zero_deg = balance_zero_deg;
+                s_telemetry.gx_deg_s = sample.gx;
+                s_telemetry.rate_deg_s = pitch_rate_deg_s;
+                s_telemetry.p_term = p_term;
+                s_telemetry.i_term = i_term;
+                s_telemetry.d_term = d_term;
+                s_telemetry.w_term = w_term;
+                s_telemetry.wheel_speed_feedback = wheel_speed_feedback;
+                s_telemetry.feedforward_speed = feedforward_speed;
+                s_telemetry.yaw_speed = yaw_speed;
+                s_telemetry.raw_forward_speed = raw_forward_speed;
+                s_telemetry.forward_speed = forward_speed;
+                s_telemetry.imu = sample;
+                s_telemetry.euler = euler;
+                s_telemetry.wheel = wheel_state;
+                portEXIT_CRITICAL(&s_runtime_mux);
+            }
             err = wheel_control_set_twist(forward_speed, yaw_speed);
             if (err != ESP_OK) {
                 if ((now - last_log_tick) >= pdMS_TO_TICKS(1000)) {
@@ -624,7 +653,8 @@ void balance_task(void *arg)
                 continue;
             }
 
-            if ((now - last_log_tick) >= pdMS_TO_TICKS(500)) {
+            if (runtime_logs_enabled &&
+                (now - last_log_tick) >= pdMS_TO_TICKS(500)) {
                 motor_feedback_t fb_left = {0};
                 motor_feedback_t fb_right = {0};
                 bool wheel_fb_ok =
@@ -632,13 +662,14 @@ void balance_task(void *arg)
                     motor_read_feedback(BOARD_WHEEL_ID_RIGHT, &fb_right) == ESP_OK;
 
                 ESP_LOGI(TAG,
-                         "theta_fb=%.2f target=%.2f err=%.2f gx=%.2f rate=%.2f p=%.2f d=%.2f w=%.2f ws=%.1f vx=%d yaw=%d raw=%d out=%d fb_ok=%d si11=%d si21=%d pos11=%u pos21=%u",
+                         "theta_fb=%.2f target=%.2f err=%.2f gx=%.2f rate=%.2f p=%.2f i=%.2f d=%.2f w=%.2f ws=%.1f vx=%d yaw=%d raw=%d out=%d fb_ok=%d si11=%d si21=%d pos11=%u pos21=%u",
                          (double)theta_fb_deg,
                          (double)balance_target_deg,
                          (double)pitch_error_deg,
                          (double)sample.gx,
                          (double)pitch_rate_deg_s,
                          (double)p_term,
+                         (double)i_term,
                          (double)d_term,
                          (double)w_term,
                          (double)wheel_speed_feedback,
