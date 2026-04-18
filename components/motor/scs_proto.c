@@ -39,7 +39,7 @@ static int s_scs_baud_rate = 0;
 // 开启后可以在串口日志中看到每一帧的完整十六进制内容，方便排查通信问题
 // ============================================================
 #ifndef SCS_DEBUG_RAW
-#define SCS_DEBUG_RAW 1
+#define SCS_DEBUG_RAW 0
 #endif
 
 /**
@@ -108,7 +108,6 @@ static void scs_normalize_status_payload(uint8_t instruction,
         count == 3 &&
         p[0] == 0x02 &&
         p[1] == SCS_INST_PING) {
-        ESP_LOGW(TAG, "normalizing PING reply payload: stripping %u request bytes", count);
         *payload = p + 3;       // 跳过 3 字节前缀
         *param_count = 0;       // PING 本身不期望返回参数
         return;
@@ -123,9 +122,6 @@ static void scs_normalize_status_payload(uint8_t instruction,
         p[0] == 0x04 &&
         p[1] == SCS_INST_READ &&
         p[2] == req_params[0]) {
-        ESP_LOGW(TAG,
-                 "normalizing READ reply payload: stripping request prefix 04 02 %02X",
-                 req_params[0]);
         *payload = p + 3;           // 跳过 3 字节前缀
         *param_count = expected;    // 保留期望的字节数
         return;
@@ -146,9 +142,6 @@ static void scs_normalize_status_payload(uint8_t instruction,
         p[0] == 0x05 &&
         p[1] == SCS_INST_WRITE &&
         p[2] == req_params[0]) {
-        ESP_LOGW(TAG,
-                 "normalizing WRITE reply payload: stripping request prefix 05 03 %02X",
-                 req_params[0]);
         *payload = p + 3;
         *param_count = 0;   // WRITE 不期望返回参数
     }

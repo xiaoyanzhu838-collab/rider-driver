@@ -15,7 +15,10 @@
 static const char *TAG = "wheel_control";
 
 static atomic_bool s_initialized;
+static atomic_bool s_body_default_pose_ready;
 static portMUX_TYPE s_state_mux = portMUX_INITIALIZER_UNLOCKED;
+static int s_body_default_goal12 = 0;
+static int s_body_default_goal22 = 0;
 static wheel_control_state_t s_state = {
     .height_percent = BOARD_BODY_HEIGHT_DEFAULT_PERCENT,
     .left_height_percent = BOARD_BODY_HEIGHT_DEFAULT_PERCENT,
@@ -49,6 +52,34 @@ int wheel_control_clamp_speed(int speed)
 static uint16_t encode_signed_i16(int speed)
 {
     return (uint16_t)(int16_t)wheel_control_clamp_speed(speed);
+}
+
+static esp_err_t capture_default_body_pose_if_needed(void)
+{
+    if (atomic_load(&s_body_default_pose_ready)) {
+        return ESP_OK;
+    }
+
+    motor_feedback_t fb12 = {0};
+    motor_feedback_t fb22 = {0};
+    esp_err_t err12 = motor_read_feedback(12, &fb12);
+    esp_err_t err22 = motor_read_feedback(22, &fb22);
+
+    if (err12 == ESP_OK && err22 == ESP_OK) {
+        portENTER_CRITICAL(&s_state_mux);
+        s_body_default_goal12 = fb12.position;
+        s_body_default_goal22 = fb22.position;
+        portEXIT_CRITICAL(&s_state_mux);
+        ESP_LOGI(TAG, "captured default body pose: pos12=%u pos22=%u", fb12.position, fb22.position);
+    } else {
+        ESP_LOGW(TAG,
+                 "capture default body pose failed: err12=%s err22=%s",
+                 esp_err_to_name(err12),
+                 esp_err_to_name(err22));
+    }
+
+    atomic_store(&s_body_default_pose_ready, true);
+    return ESP_OK;
 }
 
 static int body_goal_for_servo(uint8_t id, int percent)
@@ -105,20 +136,6 @@ static esp_err_t ensure_wheel_torque_enabled(void)
     return ESP_OK;
 }
 
-static esp_err_t sync_write_goal_speeds(uint16_t left_raw, uint16_t right_raw)
-{
-    const uint8_t payload[6] = {
-        BOARD_WHEEL_ID_LEFT,
-        (uint8_t)(left_raw & 0xFF),
-        (uint8_t)(left_raw >> 8),
-        BOARD_WHEEL_ID_RIGHT,
-        (uint8_t)(right_raw & 0xFF),
-        (uint8_t)(right_raw >> 8),
-    };
-
-    return scs_sync_write(SCS_ADDR_GOAL_SPEED_L, 2, payload, 2);
-}
-
 esp_err_t wheel_control_init(void)
 {
     if (atomic_load(&s_initialized)) {
@@ -140,23 +157,37 @@ esp_err_t wheel_control_set_body_pose_percent(int left_percent, int right_percen
     const int clamped_left = clamp_percent(left_percent);
     const int clamped_right = clamp_percent(right_percent);
     const int base_percent = (clamped_left + clamped_right + 1) / 2;
-    const uint16_t goal12 = (uint16_t)body_goal_for_servo(12, clamped_left);
-    const uint16_t goal22 = (uint16_t)body_goal_for_servo(22, clamped_right);
+    uint16_t goal12 = 0;
+    uint16_t goal22 = 0;
     const uint16_t speed = BOARD_BODY_HEIGHT_MOVE_SPEED;
-    const uint8_t payload[10] = {
-        12,
-        (uint8_t)(goal12 & 0xFF),
-        (uint8_t)(goal12 >> 8),
-        (uint8_t)(speed & 0xFF),
-        (uint8_t)(speed >> 8),
-        22,
-        (uint8_t)(goal22 & 0xFF),
-        (uint8_t)(goal22 >> 8),
-        (uint8_t)(speed & 0xFF),
-        (uint8_t)(speed >> 8),
-    };
+    uint8_t payload[10] = {0};
 
     ESP_RETURN_ON_ERROR(wheel_control_init(), TAG, "wheel control init failed");
+    ESP_RETURN_ON_ERROR(capture_default_body_pose_if_needed(), TAG, "capture default body pose failed");
+
+    if (clamped_left == BOARD_BODY_HEIGHT_DEFAULT_PERCENT &&
+        clamped_right == BOARD_BODY_HEIGHT_DEFAULT_PERCENT &&
+        atomic_load(&s_body_default_pose_ready)) {
+        portENTER_CRITICAL(&s_state_mux);
+        goal12 = (uint16_t)s_body_default_goal12;
+        goal22 = (uint16_t)s_body_default_goal22;
+        portEXIT_CRITICAL(&s_state_mux);
+    } else {
+        goal12 = (uint16_t)body_goal_for_servo(12, clamped_left);
+        goal22 = (uint16_t)body_goal_for_servo(22, clamped_right);
+    }
+
+    payload[0] = 12;
+    payload[1] = (uint8_t)(goal12 & 0xFF);
+    payload[2] = (uint8_t)(goal12 >> 8);
+    payload[3] = (uint8_t)(speed & 0xFF);
+    payload[4] = (uint8_t)(speed >> 8);
+    payload[5] = 22;
+    payload[6] = (uint8_t)(goal22 & 0xFF);
+    payload[7] = (uint8_t)(goal22 >> 8);
+    payload[8] = (uint8_t)(speed & 0xFF);
+    payload[9] = (uint8_t)(speed >> 8);
+
     ESP_RETURN_ON_ERROR(motor_set_torque(12, true), TAG, "enable body servo 12 failed");
     ESP_RETURN_ON_ERROR(motor_set_torque(22, true), TAG, "enable body servo 22 failed");
     ESP_RETURN_ON_ERROR(scs_sync_write(SCS_ADDR_GOAL_POSITION_L, 4, payload, 2),
@@ -199,7 +230,10 @@ esp_err_t wheel_control_set_chassis_speeds(int left_speed, int right_speed)
     }
 
     ESP_RETURN_ON_ERROR(ensure_wheel_torque_enabled(), TAG, "wheel torque failed");
-    ESP_RETURN_ON_ERROR(sync_write_goal_speeds(left_raw, right_raw), TAG, "wheel speed write failed");
+    ESP_RETURN_ON_ERROR(scs_write_word(BOARD_WHEEL_ID_LEFT, SCS_ADDR_GOAL_SPEED_L, left_raw),
+                        TAG, "left wheel speed write failed");
+    ESP_RETURN_ON_ERROR(scs_write_word(BOARD_WHEEL_ID_RIGHT, SCS_ADDR_GOAL_SPEED_L, right_raw),
+                        TAG, "right wheel speed write failed");
 
     state_update_speeds(left_logical, right_logical, left_raw_signed, right_raw_signed, true);
     return ESP_OK;
