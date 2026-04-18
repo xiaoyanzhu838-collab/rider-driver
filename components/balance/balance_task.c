@@ -28,6 +28,17 @@ static int clamp_range(int value, int limit)
     return value;
 }
 
+static float clampf_range(float value, float limit)
+{
+    if (value < -limit) {
+        return -limit;
+    }
+    if (value > limit) {
+        return limit;
+    }
+    return value;
+}
+
 static int map_centered_u8_to_speed(uint8_t raw, int max_abs)
 {
     int centered = (int)raw - BOARD_CONTROL_INPUT_CENTER;
@@ -145,11 +156,13 @@ void balance_task(void *arg)
     bool was_enabled = false;
     bool in_tilt_guard = false;
     bool body_pose_initialized = false;
+    bool balance_armed = false;
     bool wheel_probe_started = false;
     bool wheel_probe_finished = false;
     TickType_t last_log_tick = 0;
     TickType_t last_idle_log_tick = 0;
     TickType_t last_body_pose_retry_tick = 0;
+    TickType_t arm_candidate_tick = 0;
     TickType_t wheel_probe_start_tick = 0;
     float pitch_rate_deg_s = 0.0f;
     float wheel_speed_feedback = 0.0f;
@@ -299,25 +312,69 @@ void balance_task(void *arg)
             }
             was_enabled = false;
             in_tilt_guard = false;
+            balance_armed = false;
             pitch_rate_deg_s = 0.0f;
             wheel_speed_feedback = 0.0f;
             wheel_feedback_valid = false;
+            arm_candidate_tick = 0;
             vTaskDelay(loop_delay);
             continue;
         }
 
         if (!was_enabled) {
+            balance_armed = false;
             pitch_rate_deg_s = 0.0f;
             wheel_speed_feedback = 0.0f;
             wheel_feedback_valid = false;
             last_wheel_feedback_tick = 0;
             in_tilt_guard = false;
+            arm_candidate_tick = 0;
             ESP_LOGI(TAG,
-                     "balance enabled, pitch=%.2f deg target=%.2f deg",
+                     "balance requested, waiting for upright arm window: pitch=%.2f deg target=%.2f deg",
                      (double)euler.pitch,
                      (double)BOARD_BALANCE_PITCH_TARGET_DEG);
         }
         was_enabled = true;
+
+        if (!balance_armed) {
+            const float arm_pitch_error_deg = euler.pitch - BOARD_BALANCE_PITCH_TARGET_DEG;
+            const float arm_pitch_rate_deg_s = sample.gy * BOARD_BALANCE_PITCH_RATE_SIGN;
+            const bool arm_pitch_ok = fabsf(arm_pitch_error_deg) <= BOARD_BALANCE_ARM_PITCH_DEG;
+            const bool arm_rate_ok = fabsf(arm_pitch_rate_deg_s) <= BOARD_BALANCE_ARM_GYRO_DPS;
+
+            (void)wheel_control_stop();
+
+            if (arm_pitch_ok && arm_rate_ok) {
+                if (arm_candidate_tick == 0) {
+                    arm_candidate_tick = now;
+                }
+                if ((now - arm_candidate_tick) >= pdMS_TO_TICKS(BOARD_BALANCE_ARM_HOLD_MS)) {
+                    balance_armed = true;
+                    pitch_rate_deg_s = 0.0f;
+                    wheel_speed_feedback = 0.0f;
+                    wheel_feedback_valid = false;
+                    last_wheel_feedback_tick = 0;
+                    ESP_LOGI(TAG,
+                             "balance armed: pitch=%.2f deg gyro_y=%.2f dps",
+                             (double)euler.pitch,
+                             (double)sample.gy);
+                }
+            } else {
+                arm_candidate_tick = 0;
+                if ((now - last_log_tick) >= pdMS_TO_TICKS(500)) {
+                    ESP_LOGI(TAG,
+                             "arm_wait: pitch=%.2f gyro_y=%.2f need |pitch|<=%.1f |gyro|<=%.1f",
+                             (double)euler.pitch,
+                             (double)sample.gy,
+                             (double)BOARD_BALANCE_ARM_PITCH_DEG,
+                             (double)BOARD_BALANCE_ARM_GYRO_DPS);
+                    last_log_tick = now;
+                }
+            }
+
+            vTaskDelay(loop_delay);
+            continue;
+        }
 
         {
             const float pitch_error_deg = euler.pitch - BOARD_BALANCE_PITCH_TARGET_DEG;
@@ -356,6 +413,12 @@ void balance_task(void *arg)
                     ESP_LOGW(TAG, "tilt guard active, pitch=%.2f deg", (double)pitch_error_deg);
                 }
                 in_tilt_guard = true;
+                balance_armed = false;
+                arm_candidate_tick = 0;
+                pitch_rate_deg_s = 0.0f;
+                wheel_speed_feedback = 0.0f;
+                wheel_feedback_valid = false;
+                last_wheel_feedback_tick = 0;
                 if (err != ESP_OK && (now - last_log_tick) >= pdMS_TO_TICKS(1000)) {
                     ESP_LOGW(TAG, "wheel stop failed: %s", esp_err_to_name(err));
                     last_log_tick = now;
@@ -372,7 +435,8 @@ void balance_task(void *arg)
                 control_f = 0.0f;
             } else {
                 p_term = BOARD_BALANCE_KP * pitch_error_deg;
-                d_term = BOARD_BALANCE_KD * pitch_rate_deg_s;
+                d_term = clampf_range(BOARD_BALANCE_KD * pitch_rate_deg_s,
+                                      BOARD_BALANCE_D_TERM_LIMIT);
                 w_term = wheel_feedback_valid ? (BOARD_BALANCE_KW * wheel_speed_feedback) : 0.0f;
                 control_f = BOARD_BALANCE_OUTPUT_SIGN *
                             (p_term + d_term + w_term);
