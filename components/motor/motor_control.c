@@ -87,6 +87,24 @@ esp_err_t motor_set_position(uint8_t id, uint16_t position, uint16_t speed)
  */
 esp_err_t motor_read_feedback(uint8_t id, motor_feedback_t *out)
 {
+    esp_err_t err = ESP_OK;
+
+    err = motor_read_feedback_fast(id, out);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    // 轮电机 11/21 上，附加状态寄存器不是高可靠项。
+    // 主控制环只依赖位置/速度/负载，所以这里把扩展字段降级为“尽量读到”，
+    // 读不到也不让整次反馈失败。
+    (void)scs_read_byte(id, SCS_ADDR_PRESENT_VOLTAGE, &out->voltage);
+    (void)scs_read_byte(id, SCS_ADDR_PRESENT_TEMPERATURE, &out->temperature);
+    (void)scs_read_byte(id, SCS_ADDR_MOVING, &out->moving);
+    return ESP_OK;
+}
+
+esp_err_t motor_read_feedback_fast(uint8_t id, motor_feedback_t *out)
+{
     if (!out) {
         return ESP_ERR_INVALID_ARG;
     }
@@ -109,13 +127,6 @@ esp_err_t motor_read_feedback(uint8_t id, motor_feedback_t *out)
     out->speed = st.params[2] | ((uint16_t)st.params[3] << 8);
     out->load = st.params[4] | ((uint16_t)st.params[5] << 8);
 
-    // 分别读取单字节寄存器
-    ESP_RETURN_ON_ERROR(scs_read_byte(id, SCS_ADDR_PRESENT_VOLTAGE, &out->voltage),
-                        TAG, "read voltage failed");
-    ESP_RETURN_ON_ERROR(scs_read_byte(id, SCS_ADDR_PRESENT_TEMPERATURE, &out->temperature),
-                        TAG, "read temperature failed");
-    ESP_RETURN_ON_ERROR(scs_read_byte(id, SCS_ADDR_MOVING, &out->moving),
-                        TAG, "read moving failed");
     return ESP_OK;
 }
 

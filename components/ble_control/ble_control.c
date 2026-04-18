@@ -228,11 +228,8 @@ static void status_balance_telemetry(bool quiet)
     if (quiet) {
         status_set_quiet(
             "{\"kind\":\"telemetry\",\"ok\":1,\"seq\":%lu,\"en\":%d,\"arm\":%d,\"guard\":%d,"
-            "\"theta\":%.3f,\"target\":%.3f,\"err\":%.3f,\"zero\":%.3f,"
-            "\"ax\":%.3f,\"ay\":%.3f,\"az\":%.3f,\"gx\":%.3f,\"gy\":%.3f,\"gz\":%.3f,"
-            "\"roll\":%.3f,\"pitch\":%.3f,\"yaw\":%.3f,"
-            "\"rate\":%.3f,\"p\":%.3f,\"i\":%.3f,\"d\":%.3f,\"w\":%.3f,"
-            "\"ws\":%.3f,\"raw\":%d,\"out\":%d,\"ff\":%d,\"yaw_out\":%d,"
+            "\"theta\":%.3f,\"target\":%.3f,\"err\":%.3f,"
+            "\"rate\":%.3f,\"p\":%.3f,\"i\":%.3f,\"d\":%.3f,\"out\":%d,"
             "\"ls\":%d,\"rs\":%d}",
             (unsigned long)tel.seq,
             tel.enabled ? 1 : 0,
@@ -241,26 +238,11 @@ static void status_balance_telemetry(bool quiet)
             (double)tel.theta_fb_deg,
             (double)tel.target_deg,
             (double)tel.error_deg,
-            (double)tel.zero_deg,
-            (double)tel.imu.ax,
-            (double)tel.imu.ay,
-            (double)tel.imu.az,
-            (double)tel.imu.gx,
-            (double)tel.imu.gy,
-            (double)tel.imu.gz,
-            (double)tel.euler.roll,
-            (double)tel.euler.pitch,
-            (double)tel.euler.yaw,
             (double)tel.rate_deg_s,
             (double)tel.p_term,
             (double)tel.i_term,
             (double)tel.d_term,
-            (double)tel.w_term,
-            (double)tel.wheel_speed_feedback,
-            tel.raw_forward_speed,
             tel.forward_speed,
-            tel.feedforward_speed,
-            tel.yaw_speed,
             tel.wheel.left_speed,
             tel.wheel.right_speed);
         return;
@@ -268,11 +250,8 @@ static void status_balance_telemetry(bool quiet)
 
     status_set(
         "{\"kind\":\"telemetry\",\"ok\":1,\"seq\":%lu,\"en\":%d,\"arm\":%d,\"guard\":%d,"
-        "\"theta\":%.3f,\"target\":%.3f,\"err\":%.3f,\"zero\":%.3f,"
-        "\"ax\":%.3f,\"ay\":%.3f,\"az\":%.3f,\"gx\":%.3f,\"gy\":%.3f,\"gz\":%.3f,"
-        "\"roll\":%.3f,\"pitch\":%.3f,\"yaw\":%.3f,"
-        "\"rate\":%.3f,\"p\":%.3f,\"i\":%.3f,\"d\":%.3f,\"w\":%.3f,"
-        "\"ws\":%.3f,\"raw\":%d,\"out\":%d,\"ff\":%d,\"yaw_out\":%d,"
+        "\"theta\":%.3f,\"target\":%.3f,\"err\":%.3f,"
+        "\"rate\":%.3f,\"p\":%.3f,\"i\":%.3f,\"d\":%.3f,\"out\":%d,"
         "\"ls\":%d,\"rs\":%d}",
         (unsigned long)tel.seq,
         tel.enabled ? 1 : 0,
@@ -281,26 +260,11 @@ static void status_balance_telemetry(bool quiet)
         (double)tel.theta_fb_deg,
         (double)tel.target_deg,
         (double)tel.error_deg,
-        (double)tel.zero_deg,
-        (double)tel.imu.ax,
-        (double)tel.imu.ay,
-        (double)tel.imu.az,
-        (double)tel.imu.gx,
-        (double)tel.imu.gy,
-        (double)tel.imu.gz,
-        (double)tel.euler.roll,
-        (double)tel.euler.pitch,
-        (double)tel.euler.yaw,
         (double)tel.rate_deg_s,
         (double)tel.p_term,
         (double)tel.i_term,
         (double)tel.d_term,
-        (double)tel.w_term,
-        (double)tel.wheel_speed_feedback,
-        tel.raw_forward_speed,
         tel.forward_speed,
-        tel.feedforward_speed,
-        tel.yaw_speed,
         tel.wheel.left_speed,
         tel.wheel.right_speed);
 }

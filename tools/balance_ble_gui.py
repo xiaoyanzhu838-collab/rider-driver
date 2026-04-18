@@ -6,6 +6,7 @@ import json
 import queue
 import threading
 import tkinter as tk
+from collections import deque
 from dataclasses import dataclass
 from tkinter import messagebox, ttk
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
@@ -166,6 +167,8 @@ class BleBridge:
 
 
 class BalanceGui:
+    HISTORY_SIZE = 180
+
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title("RiderDriver 蓝牙调参")
@@ -193,11 +196,14 @@ class BalanceGui:
         self.telemetry_vars: Dict[str, tk.StringVar] = {
             key: tk.StringVar(value="--")
             for key in (
-                "theta", "target", "err", "zero", "roll", "pitch", "yaw",
-                "ax", "ay", "az", "gx", "gy", "gz", "rate",
-                "p", "i", "d", "w", "ws", "raw", "out", "ff", "yaw_out",
+                "theta", "target", "err", "rate",
+                "p", "i", "d", "out",
                 "ls", "rs", "seq", "armed", "guard",
             )
+        }
+        self.plot_history: Dict[str, deque[float]] = {
+            key: deque(maxlen=self.HISTORY_SIZE)
+            for key in ("theta", "target", "rate", "out", "ls", "rs")
         }
 
         self._build_ui()
@@ -263,30 +269,26 @@ class BalanceGui:
             row=1, column=2, columnspan=2, padx=4, pady=6, sticky="ew"
         )
 
-        stream_frame = ttk.LabelFrame(ctrl, text="遥测")
+        stream_frame = ttk.LabelFrame(ctrl, text="监看")
         stream_frame.pack(side=tk.LEFT, fill=tk.Y)
         ttk.Label(stream_frame, text="间隔 ms").grid(row=0, column=0, padx=6, pady=6)
         ttk.Entry(stream_frame, textvariable=self.interval_var, width=8).grid(row=0, column=1, padx=6, pady=6)
-        ttk.Button(stream_frame, text="启动推流", command=self.start_stream).grid(row=1, column=0, padx=6, pady=6, sticky="ew")
-        ttk.Button(stream_frame, text="停止推流", command=self.stop_stream).grid(row=1, column=1, padx=6, pady=6, sticky="ew")
+        ttk.Button(stream_frame, text="开始监看", command=self.start_stream).grid(row=1, column=0, padx=6, pady=6, sticky="ew")
+        ttk.Button(stream_frame, text="停止监看", command=self.stop_stream).grid(row=1, column=1, padx=6, pady=6, sticky="ew")
         ttk.Button(stream_frame, text="抓一次", command=self.read_once).grid(row=2, column=0, columnspan=2, padx=6, pady=6, sticky="ew")
 
         body = ttk.Panedwindow(main, orient=tk.HORIZONTAL)
         body.pack(fill=tk.BOTH, expand=True)
 
-        telemetry_frame = ttk.LabelFrame(body, text="实时反馈")
+        telemetry_frame = ttk.LabelFrame(body, text="关键反馈")
         log_frame = ttk.LabelFrame(body, text="事件")
         body.add(telemetry_frame, weight=3)
         body.add(log_frame, weight=2)
 
         fields = [
             ("Seq", "seq"), ("Armed", "armed"), ("Guard", "guard"),
-            ("theta", "theta"), ("target", "target"), ("err", "err"), ("zero", "zero"),
-            ("roll", "roll"), ("pitch", "pitch"), ("yaw", "yaw"),
-            ("ax", "ax"), ("ay", "ay"), ("az", "az"),
-            ("gx", "gx"), ("gy", "gy"), ("gz", "gz"), ("rate", "rate"),
-            ("P", "p"), ("I", "i"), ("D", "d"), ("W", "w"), ("wheel_fb", "ws"),
-            ("raw", "raw"), ("out", "out"), ("ff", "ff"), ("yaw_out", "yaw_out"),
+            ("theta", "theta"), ("target", "target"), ("err", "err"), ("rate", "rate"),
+            ("P", "p"), ("I", "i"), ("D", "d"), ("out", "out"),
             ("left_speed", "ls"), ("right_speed", "rs"),
         ]
 
@@ -297,6 +299,14 @@ class BalanceGui:
             ttk.Label(telemetry_frame, textvariable=self.telemetry_vars[key], width=12).grid(
                 row=row, column=col + 1, padx=6, pady=4, sticky="w"
             )
+
+        plot_frame = ttk.LabelFrame(telemetry_frame, text="波形")
+        plot_frame.grid(row=3, column=0, columnspan=8, padx=6, pady=(10, 4), sticky="nsew")
+        self.plot_canvas = tk.Canvas(plot_frame, width=760, height=300, bg="#101418", highlightthickness=0)
+        self.plot_canvas.pack(fill=tk.BOTH, expand=True)
+        telemetry_frame.columnconfigure(7, weight=1)
+        telemetry_frame.rowconfigure(3, weight=1)
+        self._draw_plots()
 
         self.log_text = tk.Text(log_frame, height=20, wrap="word")
         self.log_text.pack(fill=tk.BOTH, expand=True)
@@ -402,7 +412,12 @@ class BalanceGui:
                 show_error=False,
             )
 
-        self.root.after(180, self._poll_telemetry)
+        poll_ms = 180
+        try:
+            poll_ms = max(60, int(self.interval_var.get()))
+        except ValueError:
+            pass
+        self.root.after(poll_ms, self._poll_telemetry)
 
     def _update_pid(self, payload: dict) -> None:
         self.kp_var.set(f"{float(payload.get('kp', 0.0)):.4f}")
@@ -420,6 +435,70 @@ class BalanceGui:
         else:
             self.telemetry_vars[key].set(str(value))
 
+    def _push_history(self, key: str, value: float) -> None:
+        if key in self.plot_history:
+            self.plot_history[key].append(value)
+
+    def _draw_series(
+        self,
+        points: Sequence[float],
+        color: str,
+        y_min: float,
+        y_max: float,
+        top: float,
+        height: float,
+        width: float,
+    ) -> None:
+        if len(points) < 2 or y_max <= y_min:
+            return
+
+        coords: List[float] = []
+        step_x = width / max(1, self.HISTORY_SIZE - 1)
+        for idx, value in enumerate(points):
+            x = idx * step_x
+            norm = (value - y_min) / (y_max - y_min)
+            y = top + height - (norm * height)
+            coords.extend((x, y))
+        self.plot_canvas.create_line(*coords, fill=color, width=2, smooth=True)
+
+    def _draw_plots(self) -> None:
+        if not hasattr(self, "plot_canvas"):
+            return
+
+        canvas = self.plot_canvas
+        canvas.delete("all")
+        width = max(760, int(canvas.winfo_width() or 760))
+        height = max(300, int(canvas.winfo_height() or 300))
+        canvas.create_rectangle(0, 0, width, height, fill="#101418", outline="")
+
+        split = height / 2
+        canvas.create_line(0, split, width, split, fill="#2b3440", width=1)
+        canvas.create_text(10, 10, anchor="nw", fill="#d7dde5",
+                           text="上图: theta / target / rate")
+        canvas.create_text(10, split + 10, anchor="nw", fill="#d7dde5",
+                           text="下图: out / left_speed / right_speed")
+
+        upper_values = list(self.plot_history["theta"]) + list(self.plot_history["target"]) + list(self.plot_history["rate"])
+        lower_values = list(self.plot_history["out"]) + list(self.plot_history["ls"]) + list(self.plot_history["rs"])
+
+        upper_span = max([5.0] + [abs(v) for v in upper_values]) if upper_values else 5.0
+        lower_span = max([30.0] + [abs(v) for v in lower_values]) if lower_values else 30.0
+
+        self._draw_series(list(self.plot_history["theta"]), "#58a6ff", -upper_span, upper_span, 28, split - 40, width, )
+        self._draw_series(list(self.plot_history["target"]), "#2ea043", -upper_span, upper_span, 28, split - 40, width, )
+        self._draw_series(list(self.plot_history["rate"]), "#f2cc60", -upper_span, upper_span, 28, split - 40, width, )
+
+        self._draw_series(list(self.plot_history["out"]), "#ff7b72", -lower_span, lower_span, split + 28, split - 40, width, )
+        self._draw_series(list(self.plot_history["ls"]), "#c678dd", -lower_span, lower_span, split + 28, split - 40, width, )
+        self._draw_series(list(self.plot_history["rs"]), "#56b6c2", -lower_span, lower_span, split + 28, split - 40, width, )
+
+        canvas.create_text(width - 10, 10, anchor="ne", fill="#58a6ff", text="theta")
+        canvas.create_text(width - 80, 10, anchor="ne", fill="#2ea043", text="target")
+        canvas.create_text(width - 160, 10, anchor="ne", fill="#f2cc60", text="rate")
+        canvas.create_text(width - 10, split + 10, anchor="ne", fill="#ff7b72", text="out")
+        canvas.create_text(width - 90, split + 10, anchor="ne", fill="#c678dd", text="left")
+        canvas.create_text(width - 160, split + 10, anchor="ne", fill="#56b6c2", text="right")
+
     def _update_telemetry(self, payload: dict) -> None:
         mapping = {
             "seq": ("seq", 0),
@@ -428,26 +507,11 @@ class BalanceGui:
             "theta": ("theta", 3),
             "target": ("target", 3),
             "err": ("err", 3),
-            "zero": ("zero", 3),
-            "roll": ("roll", 3),
-            "pitch": ("pitch", 3),
-            "yaw": ("yaw", 3),
-            "ax": ("ax", 3),
-            "ay": ("ay", 3),
-            "az": ("az", 3),
-            "gx": ("gx", 3),
-            "gy": ("gy", 3),
-            "gz": ("gz", 3),
             "rate": ("rate", 3),
             "p": ("p", 3),
             "i": ("i", 3),
             "d": ("d", 3),
-            "w": ("w", 3),
-            "ws": ("ws", 3),
-            "raw": ("raw", 0),
             "out": ("out", 0),
-            "ff": ("ff", 0),
-            "yaw_out": ("yaw_out", 0),
             "ls": ("ls", 0),
             "rs": ("rs", 0),
         }
@@ -459,6 +523,11 @@ class BalanceGui:
                 self._set_tel(dst, value, 0)
             else:
                 self._set_tel(dst, float(value), digits)
+
+        for key in ("theta", "target", "rate", "out", "ls", "rs"):
+            if key in payload:
+                self._push_history(key, float(payload[key]))
+        self._draw_plots()
 
     def scan_devices(self) -> None:
         self.status_var.set("扫描中...")
@@ -545,28 +614,13 @@ class BalanceGui:
         )
 
     def start_stream(self) -> None:
-        try:
-            interval = int(self.interval_var.get())
-        except ValueError:
-            messagebox.showwarning("提示", "推流间隔必须是整数")
-            return
         self.telemetry_poll_enabled = True
-        self.stream_started = True
-        self._submit(
-            self.bridge.send_command(f"BTELE 1 {interval}", accepted_kinds=["btele"]),
-            lambda result: self._append_log(f"已启动推流: {result[0]}"),
-            "启动推流失败",
-        )
+        self._append_log("已开始监看（本地轮询关键数据）")
 
     def stop_stream(self) -> None:
         self.telemetry_poll_enabled = False
         self.telemetry_poll_inflight = False
-        self.stream_started = False
-        self._submit(
-            self.bridge.send_command("BTELE 0 100", accepted_kinds=["btele"]),
-            lambda result: self._append_log(f"已停止推流: {result[0]}"),
-            "停止推流失败",
-        )
+        self._append_log("已停止监看")
 
     def set_board_log(self, enabled: bool) -> None:
         cmd = f"BLOG {1 if enabled else 0}"

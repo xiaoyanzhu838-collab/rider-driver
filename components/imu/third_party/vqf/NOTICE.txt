@@ -1,0 +1,10 @@
+Imported from the official VQF repository:
+https://github.com/dlaidig/vqf
+
+Algorithm paper:
+Daniel Laidig, Thomas Seel.
+"VQF: Highly Accurate IMU Orientation Estimation with Bias Estimation and Magnetic Disturbance Rejection."
+Information Fusion 91 (2023) 187-204.
+https://arxiv.org/abs/2203.17024
+
+Included source files in this directory are provided under the MIT license by the original author.

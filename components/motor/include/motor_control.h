@@ -95,6 +95,21 @@ esp_err_t motor_set_position(uint8_t id, uint16_t position, uint16_t speed);
 esp_err_t motor_read_feedback(uint8_t id, motor_feedback_t *out);
 
 /**
+ * @brief 快速读取电机核心反馈
+ *
+ * 只读取连续 6 字节主状态块：
+ *   - position
+ *   - speed
+ *   - load
+ *
+ * 不再额外读取电压 / 温度 / moving，适合平衡环里的高频采样。
+ *
+ * @param id   舵机 ID
+ * @param out  输出：反馈数据结构体
+ */
+esp_err_t motor_read_feedback_fast(uint8_t id, motor_feedback_t *out);
+
+/**
  * @brief 批量读取所有电机的当前位置
  *
  * @param positions  输出数组（容量需 >= MOTOR_COUNT）

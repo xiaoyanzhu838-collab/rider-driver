@@ -110,6 +110,10 @@ static void state_update_speeds(int left, int right, int left_raw, int right_raw
 static esp_err_t ensure_wheel_torque_enabled(void)
 {
     bool enabled = false;
+    uint8_t payload[4] = {
+        BOARD_WHEEL_ID_LEFT, 1,
+        BOARD_WHEEL_ID_RIGHT, 1,
+    };
 
     portENTER_CRITICAL(&s_state_mux);
     enabled = s_state.wheel_torque_enabled;
@@ -119,10 +123,8 @@ static esp_err_t ensure_wheel_torque_enabled(void)
         return ESP_OK;
     }
 
-    ESP_RETURN_ON_ERROR(scs_write_byte(BOARD_WHEEL_ID_LEFT, SCS_ADDR_TORQUE_ENABLE, 1),
-                        TAG, "enable left wheel torque failed");
-    ESP_RETURN_ON_ERROR(scs_write_byte(BOARD_WHEEL_ID_RIGHT, SCS_ADDR_TORQUE_ENABLE, 1),
-                        TAG, "enable right wheel torque failed");
+    ESP_RETURN_ON_ERROR(scs_sync_write(SCS_ADDR_TORQUE_ENABLE, 1, payload, 2),
+                        TAG, "enable wheel torque failed");
 
     state_update_speeds(0, 0, 0, 0, true);
     return ESP_OK;
@@ -196,14 +198,21 @@ esp_err_t wheel_control_set_chassis_speeds(int left_speed, int right_speed)
     int right_raw_signed = right_logical * BOARD_WHEEL_RIGHT_SIGN;
     uint16_t left_raw = encode_signed_i16(left_raw_signed);
     uint16_t right_raw = encode_signed_i16(right_raw_signed);
+    uint8_t payload[6] = {0};
     int desired_height = BOARD_BODY_HEIGHT_DEFAULT_PERCENT;
     bool body_pose_applied = false;
+    bool wheel_torque_enabled = false;
+    int current_left_speed = 0;
+    int current_right_speed = 0;
 
     ESP_RETURN_ON_ERROR(wheel_control_init(), TAG, "wheel control init failed");
 
     portENTER_CRITICAL(&s_state_mux);
     desired_height = s_state.height_percent;
     body_pose_applied = s_state.body_pose_applied;
+    wheel_torque_enabled = s_state.wheel_torque_enabled;
+    current_left_speed = s_state.left_speed;
+    current_right_speed = s_state.right_speed;
     portEXIT_CRITICAL(&s_state_mux);
 
     if (!body_pose_applied) {
@@ -211,11 +220,21 @@ esp_err_t wheel_control_set_chassis_speeds(int left_speed, int right_speed)
                             TAG, "apply safe body pose failed");
     }
 
+    if (wheel_torque_enabled &&
+        current_left_speed == left_logical &&
+        current_right_speed == right_logical) {
+        return ESP_OK;
+    }
+
     ESP_RETURN_ON_ERROR(ensure_wheel_torque_enabled(), TAG, "wheel torque failed");
-    ESP_RETURN_ON_ERROR(scs_write_word(BOARD_WHEEL_ID_LEFT, SCS_ADDR_GOAL_SPEED_L, left_raw),
-                        TAG, "left wheel speed write failed");
-    ESP_RETURN_ON_ERROR(scs_write_word(BOARD_WHEEL_ID_RIGHT, SCS_ADDR_GOAL_SPEED_L, right_raw),
-                        TAG, "right wheel speed write failed");
+    payload[0] = BOARD_WHEEL_ID_LEFT;
+    payload[1] = (uint8_t)(left_raw & 0xFF);
+    payload[2] = (uint8_t)(left_raw >> 8);
+    payload[3] = BOARD_WHEEL_ID_RIGHT;
+    payload[4] = (uint8_t)(right_raw & 0xFF);
+    payload[5] = (uint8_t)(right_raw >> 8);
+    ESP_RETURN_ON_ERROR(scs_sync_write(SCS_ADDR_GOAL_SPEED_L, 2, payload, 2),
+                        TAG, "wheel speed sync write failed");
 
     state_update_speeds(left_logical, right_logical, left_raw_signed, right_raw_signed, true);
     return ESP_OK;

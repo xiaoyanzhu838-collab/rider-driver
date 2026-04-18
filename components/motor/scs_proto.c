@@ -8,6 +8,7 @@
 #include "esp_check.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 
 static const char *TAG = "scs";
 
@@ -15,6 +16,8 @@ static const char *TAG = "scs";
 static bool s_scs_initialized = false;
 /* 记录当前波特率（初始化后不可更改） */
 static int s_scs_baud_rate = 0;
+/* 保护 UART2 半双工总线，避免多个任务交错发包/收包 */
+static SemaphoreHandle_t s_scs_bus_mutex = NULL;
 
 // ============================================================
 // UART 硬件配置
@@ -33,6 +36,7 @@ static int s_scs_baud_rate = 0;
  * 然后一次性丢弃，才能干净地接收舵机的真实回复。
  */
 #define SCS_ECHO_FLUSH_DELAY_MS  3
+#define SCS_BUS_LOCK_TIMEOUT_MS  100
 
 // ============================================================
 // 调试开关：打印原始收发字节（1=开启，0=关闭）
@@ -179,6 +183,13 @@ static uint8_t scs_checksum(const uint8_t *pkt, size_t pkt_len)
 // ============================================================
 esp_err_t scs_init(int baud_rate)
 {
+    if (s_scs_bus_mutex == NULL) {
+        s_scs_bus_mutex = xSemaphoreCreateMutex();
+        if (s_scs_bus_mutex == NULL) {
+            return ESP_ERR_NO_MEM;
+        }
+    }
+
     // 防止重复初始化：如果已经初始化且波特率一致，直接返回成功
     if (s_scs_initialized) {
         if (baud_rate == s_scs_baud_rate) {
@@ -235,8 +246,16 @@ esp_err_t scs_txrx(uint8_t id, uint8_t instruction,
                     const uint8_t *params, size_t param_len,
                     scs_status_t *status, uint32_t timeout_ms)
 {
+    bool bus_locked = false;
+
     // 懒初始化：首次调用时自动初始化总线
     ESP_RETURN_ON_ERROR(scs_init(SCS_DEFAULT_BAUD_RATE), TAG, "lazy init failed");
+
+    if (xSemaphoreTake(s_scs_bus_mutex, pdMS_TO_TICKS(SCS_BUS_LOCK_TIMEOUT_MS)) != pdTRUE) {
+        ESP_LOGW(TAG, "bus lock timeout: id=%u inst=0x%02X", id, instruction);
+        return ESP_ERR_TIMEOUT;
+    }
+    bus_locked = true;
 
     // --- 第一步：组装指令包 ---
     // 帧结构: FF FF ID LEN INST [PARAMS...] CHECKSUM
@@ -268,13 +287,18 @@ esp_err_t scs_txrx(uint8_t id, uint8_t instruction,
     int written = uart_write_bytes(SCS_UART_NUM, pkt, tx_len);
     if (written != (int)tx_len) {
         ESP_LOGW(TAG, "tx: wrote %d/%u", written, (unsigned)tx_len);
-        return ESP_FAIL;
+        goto cleanup_fail;
     }
 
     // --- 第四步：等待 UART 发送完成 ---
     // 半双工模式下，必须等 TX 彻底结束才能切换到 RX 接收模式
-    ESP_RETURN_ON_ERROR(uart_wait_tx_done(SCS_UART_NUM, pdMS_TO_TICKS(20)),
-                        TAG, "tx_done timeout");
+    {
+        esp_err_t err = uart_wait_tx_done(SCS_UART_NUM, pdMS_TO_TICKS(20));
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "tx_done timeout");
+            goto cleanup_fail;
+        }
+    }
 
     // --- 第五步：丢弃 TX 回环字节 ---
     // 在半双工单线总线上，主控发出的每个字节都会通过总线回环到 RX 端。
@@ -294,6 +318,7 @@ esp_err_t scs_txrx(uint8_t id, uint8_t instruction,
 
     // 广播地址（0xFE）不等待回复
     if (id == SCS_BROADCAST_ID) {
+        xSemaphoreGive(s_scs_bus_mutex);
         return ESP_OK;
     }
 
@@ -306,7 +331,7 @@ esp_err_t scs_txrx(uint8_t id, uint8_t instruction,
     int n = uart_read_bytes(SCS_UART_NUM, rxbuf, 4, pdMS_TO_TICKS(timeout_ms));
     if (n < 4) {
         ESP_LOGD(TAG, "rx header timeout (got %d bytes)", n);
-        return ESP_ERR_TIMEOUT;
+        goto cleanup_timeout;
     }
     rx_total = n;
 
@@ -337,7 +362,7 @@ esp_err_t scs_txrx(uint8_t id, uint8_t instruction,
     // 始终找不到帧头，通信异常
     if (hdr_pos < 0) {
         hex_dump("UART2_RX_NO_HDR", rxbuf, rx_total);
-        return ESP_ERR_INVALID_RESPONSE;
+        goto cleanup_bad_response;
     }
 
     // 如果帧头不在 offset 0，说明前面有残留的回环字节泄漏
@@ -354,7 +379,7 @@ esp_err_t scs_txrx(uint8_t id, uint8_t instruction,
                              pdMS_TO_TICKS(timeout_ms));
         if (n <= 0) {
             ESP_LOGW(TAG, "rx hdr incomplete after align (%d bytes)", rx_total);
-            return ESP_ERR_TIMEOUT;
+            goto cleanup_timeout;
         }
         rx_total += n;
     }
@@ -364,7 +389,7 @@ esp_err_t scs_txrx(uint8_t id, uint8_t instruction,
     if (rx_len_field < 2 || rx_len_field > SCS_MAX_PKT_LEN - 4) {
         ESP_LOGW(TAG, "bad rx LEN=%u", rx_len_field);
         hex_dump("UART2_RX_BAD", rxbuf, rx_total);
-        return ESP_ERR_INVALID_RESPONSE;
+        goto cleanup_bad_response;
     }
 
     // 接收完整的帧体：需要总字节数 = 4 (header) + rx_len_field (body)
@@ -374,7 +399,7 @@ esp_err_t scs_txrx(uint8_t id, uint8_t instruction,
                              pdMS_TO_TICKS(timeout_ms));
         if (n <= 0) {
             ESP_LOGW(TAG, "rx body incomplete: got %d, expect %d", rx_total, need_total);
-            return ESP_ERR_TIMEOUT;
+            goto cleanup_timeout;
         }
         rx_total += n;
     }
@@ -386,7 +411,7 @@ esp_err_t scs_txrx(uint8_t id, uint8_t instruction,
     uint8_t got_chk = rxbuf[need_total - 1];               // 包中携带的校验和
     if (calc_chk != got_chk) {
         ESP_LOGW(TAG, "rx checksum mismatch: calc=0x%02X got=0x%02X", calc_chk, got_chk);
-        return ESP_ERR_INVALID_CRC;
+        goto cleanup_bad_crc;
     }
 
     // 校验回包 ID 是否与请求的目标 ID 匹配（防止总线上其他舵机的回复混淆）
@@ -410,7 +435,32 @@ esp_err_t scs_txrx(uint8_t id, uint8_t instruction,
         }
     }
 
+    xSemaphoreGive(s_scs_bus_mutex);
     return ESP_OK;
+
+cleanup_timeout:
+    if (bus_locked) {
+        xSemaphoreGive(s_scs_bus_mutex);
+    }
+    return ESP_ERR_TIMEOUT;
+
+cleanup_bad_response:
+    if (bus_locked) {
+        xSemaphoreGive(s_scs_bus_mutex);
+    }
+    return ESP_ERR_INVALID_RESPONSE;
+
+cleanup_bad_crc:
+    if (bus_locked) {
+        xSemaphoreGive(s_scs_bus_mutex);
+    }
+    return ESP_ERR_INVALID_CRC;
+
+cleanup_fail:
+    if (bus_locked) {
+        xSemaphoreGive(s_scs_bus_mutex);
+    }
+    return ESP_FAIL;
 }
 
 // ============================================================
