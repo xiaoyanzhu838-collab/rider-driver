@@ -47,3 +47,44 @@
 #define BOARD_BAT_VOLTAGE_MIN      (6.4f)   // 2S锂电 空电 ~3.2V*2
 #define BOARD_BAT_VOLTAGE_MAX      (8.4f)   // 2S锂电 满电 ~4.2V*2
 
+// ========== CHASSIS / BALANCE ==========
+// 11 / 21 are used as the two wheel nodes on UART2.
+#define BOARD_WHEEL_ID_LEFT        (11)
+#define BOARD_WHEEL_ID_RIGHT       (21)
+
+// Safe body-open posture derived from the 12 / 22 servo boundary exploration.
+#define BOARD_BODY_HEIGHT_HOME_12  (599)
+#define BOARD_BODY_HEIGHT_HOME_22  (439)
+#define BOARD_BODY_HEIGHT_DELTA_12 (104)
+#define BOARD_BODY_HEIGHT_DELTA_22 (112)
+#define BOARD_BODY_HEIGHT_DEFAULT_PERCENT (20)
+#define BOARD_BODY_HEIGHT_RANGE_PERCENT   (25)
+#define BOARD_BODY_HEIGHT_MOVE_SPEED      (200)
+#define BOARD_BODY_LEVEL_LOOP_PERIOD_MS   (80)
+#define BOARD_BODY_LEVEL_ROLL_TARGET_DEG  (0.0f)
+#define BOARD_BODY_LEVEL_ROLL_SIGN        (-1.0f)
+#define BOARD_BODY_LEVEL_ROLL_DEADBAND_DEG (1.0f)
+#define BOARD_BODY_LEVEL_KP               (1.2f)
+#define BOARD_BODY_LEVEL_MAX_TRIM_PERCENT (18)
+#define BOARD_BODY_LEVEL_MAX_STEP_PERCENT (2)
+
+// Signed speed envelope confirmed on the wheel nodes.
+#define BOARD_WHEEL_SPEED_LIMIT    (140)
+#define BOARD_WHEEL_SPEED_RECOMMENDED (120)
+
+// Logical chassis wheel direction to raw wheel signed-speed mapping.
+// Keep these as board-level constants so field tuning only needs one edit.
+#define BOARD_WHEEL_LEFT_SIGN      (1)
+#define BOARD_WHEEL_RIGHT_SIGN     (1)
+
+// Balance control loop defaults.
+#define BOARD_CONTROL_INPUT_CENTER (128)
+#define BOARD_CONTROL_INPUT_DEADBAND (4)
+#define BOARD_BALANCE_LOOP_PERIOD_MS (10)
+#define BOARD_BALANCE_TILT_CUTOFF_DEG (35.0f)
+#define BOARD_BALANCE_OUTPUT_SIGN  (1.0f)
+#define BOARD_BALANCE_KP           (8.0f)
+#define BOARD_BALANCE_KD           (0.35f)
+#define BOARD_BALANCE_VX_MAX_SPEED (45)
+#define BOARD_BALANCE_VYAW_MAX_SPEED (35)
+

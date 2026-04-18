@@ -15,5 +15,5 @@
     "--compile-commands-dir=d:\\workspace\\code\\rider_driver\\build"
   ],
   "idf.flashType": "UART",
-  "idf.portWin": "COM3"
+  "idf.portWin": "COM476"
 }

@@ -22,7 +22,12 @@ static const char *TAG = "proto";
 // 写命令状态（线程安全读写）
 // ============================================================
 static portMUX_TYPE s_state_mux = portMUX_INITIALIZER_UNLOCKED;
-static proto_write_state_t s_state;
+static proto_write_state_t s_state = {
+    .vx = 0x80,
+    .vyaw = 0x80,
+    .translation_z = 0x80,
+    .attitude_r = 0x80,
+};
 
 void proto_get_write_state(proto_write_state_t *out)
 {
