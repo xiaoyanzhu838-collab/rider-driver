@@ -57,12 +57,13 @@
 #define BOARD_BODY_HEIGHT_HOME_22  (439)
 #define BOARD_BODY_HEIGHT_DELTA_12 (104)
 #define BOARD_BODY_HEIGHT_DELTA_22 (112)
-#define BOARD_BODY_HEIGHT_DEFAULT_PERCENT (20)
+#define BOARD_BODY_HEIGHT_DEFAULT_PERCENT (25)
 #define BOARD_BODY_HEIGHT_MOVE_SPEED      (200)
 
 // Signed speed envelope confirmed on the wheel nodes.
 #define BOARD_WHEEL_SPEED_LIMIT    (140)
 #define BOARD_WHEEL_MIN_EFFECTIVE_SPEED (45)
+#define BOARD_WHEEL_BREAKAWAY_SPEED (60)
 #define BOARD_WHEEL_SPEED_RECOMMENDED (120)
 
 // Logical chassis wheel direction to raw wheel signed-speed mapping.
@@ -77,11 +78,23 @@
 #define BOARD_BALANCE_TILT_CUTOFF_DEG (35.0f)
 #define BOARD_BALANCE_FORCE_ENABLE (1)
 #define BOARD_BALANCE_PITCH_TARGET_DEG (0.0f)
-#define BOARD_BALANCE_PITCH_DEADBAND_DEG (0.0f)
-#define BOARD_BALANCE_OUTPUT_SIGN  (1.0f)
+#define BOARD_BALANCE_PITCH_DEADBAND_DEG (0.4f)
+#define BOARD_BALANCE_RATE_DEADBAND_DPS (2.0f)
+#define BOARD_BALANCE_WHEEL_FEEDBACK_INTERVAL_MS (20)
+#define BOARD_BALANCE_STICTION_PITCH_DEG (0.6f)
+#define BOARD_BALANCE_STICTION_SPEED_THRESHOLD (5.0f)
+#define BOARD_BALANCE_OUTPUT_SIGN  (-1.0f)
 #define BOARD_BALANCE_PITCH_RATE_SIGN (1.0f)
-#define BOARD_BALANCE_KP           (18.0f)
-#define BOARD_BALANCE_KD           (0.60f)
+#define BOARD_BALANCE_KP           (3.2f)
+#define BOARD_BALANCE_KD           (2.6f)
+#define BOARD_BALANCE_KW           (0.55f)
 #define BOARD_BALANCE_VX_MAX_SPEED (45)
 #define BOARD_BALANCE_VYAW_MAX_SPEED (35)
+
+// Temporary bring-up probe: keep body height fixed, skip PD balance,
+// then drive the chassis in one direction so we can observe pitch response.
+#define BOARD_WHEEL_PROBE_ENABLE       (0)
+#define BOARD_WHEEL_PROBE_START_DELAY_MS (3000)
+#define BOARD_WHEEL_PROBE_RUN_MS       (5000)
+#define BOARD_WHEEL_PROBE_SPEED        (-45)
 

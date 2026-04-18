@@ -15,10 +15,10 @@
 static const char *TAG = "wheel_control";
 
 static atomic_bool s_initialized;
-static atomic_bool s_body_default_pose_ready;
+static atomic_bool s_body_home_ready;
 static portMUX_TYPE s_state_mux = portMUX_INITIALIZER_UNLOCKED;
-static int s_body_default_goal12 = 0;
-static int s_body_default_goal22 = 0;
+static int s_body_home12 = BOARD_BODY_HEIGHT_HOME_12;
+static int s_body_home22 = BOARD_BODY_HEIGHT_HOME_22;
 static wheel_control_state_t s_state = {
     .height_percent = BOARD_BODY_HEIGHT_DEFAULT_PERCENT,
     .left_height_percent = BOARD_BODY_HEIGHT_DEFAULT_PERCENT,
@@ -54,44 +54,36 @@ static uint16_t encode_signed_i16(int speed)
     return (uint16_t)(int16_t)wheel_control_clamp_speed(speed);
 }
 
-static esp_err_t capture_default_body_pose_if_needed(void)
+static esp_err_t capture_body_home_if_needed(void)
 {
-    if (atomic_load(&s_body_default_pose_ready)) {
+    if (atomic_load(&s_body_home_ready)) {
         return ESP_OK;
     }
 
-    motor_feedback_t fb12 = {0};
-    motor_feedback_t fb22 = {0};
-    esp_err_t err12 = motor_read_feedback(12, &fb12);
-    esp_err_t err22 = motor_read_feedback(22, &fb22);
-
-    if (err12 == ESP_OK && err22 == ESP_OK) {
-        portENTER_CRITICAL(&s_state_mux);
-        s_body_default_goal12 = fb12.position;
-        s_body_default_goal22 = fb22.position;
-        portEXIT_CRITICAL(&s_state_mux);
-        ESP_LOGI(TAG, "captured default body pose: pos12=%u pos22=%u", fb12.position, fb22.position);
-    } else {
-        ESP_LOGW(TAG,
-                 "capture default body pose failed: err12=%s err22=%s",
-                 esp_err_to_name(err12),
-                 esp_err_to_name(err22));
-    }
-
-    atomic_store(&s_body_default_pose_ready, true);
+    ESP_LOGI(TAG, "using fixed body home: home12=%d home22=%d",
+             BOARD_BODY_HEIGHT_HOME_12, BOARD_BODY_HEIGHT_HOME_22);
+    atomic_store(&s_body_home_ready, true);
     return ESP_OK;
 }
 
 static int body_goal_for_servo(uint8_t id, int percent)
 {
+    int home12 = 0;
+    int home22 = 0;
+
     percent = clamp_percent(percent);
+    portENTER_CRITICAL(&s_state_mux);
+    home12 = s_body_home12;
+    home22 = s_body_home22;
+    portEXIT_CRITICAL(&s_state_mux);
+
     if (id == 12) {
         int delta = (BOARD_BODY_HEIGHT_DELTA_12 * percent + 50) / 100;
-        return BOARD_BODY_HEIGHT_HOME_12 - delta;
+        return home12 - delta;
     }
 
     int delta = (BOARD_BODY_HEIGHT_DELTA_22 * percent + 50) / 100;
-    return BOARD_BODY_HEIGHT_HOME_22 + delta;
+    return home22 + delta;
 }
 
 static void state_update_body_pose(int base_percent, int left_percent, int right_percent, bool applied)
@@ -163,20 +155,10 @@ esp_err_t wheel_control_set_body_pose_percent(int left_percent, int right_percen
     uint8_t payload[10] = {0};
 
     ESP_RETURN_ON_ERROR(wheel_control_init(), TAG, "wheel control init failed");
-    ESP_RETURN_ON_ERROR(capture_default_body_pose_if_needed(), TAG, "capture default body pose failed");
+    ESP_RETURN_ON_ERROR(capture_body_home_if_needed(), TAG, "capture body home failed");
 
-    if (clamped_left == BOARD_BODY_HEIGHT_DEFAULT_PERCENT &&
-        clamped_right == BOARD_BODY_HEIGHT_DEFAULT_PERCENT &&
-        atomic_load(&s_body_default_pose_ready)) {
-        portENTER_CRITICAL(&s_state_mux);
-        goal12 = (uint16_t)s_body_default_goal12;
-        goal22 = (uint16_t)s_body_default_goal22;
-        portEXIT_CRITICAL(&s_state_mux);
-    } else {
-        goal12 = (uint16_t)body_goal_for_servo(12, clamped_left);
-        goal22 = (uint16_t)body_goal_for_servo(22, clamped_right);
-    }
-
+    goal12 = (uint16_t)body_goal_for_servo(12, clamped_left);
+    goal22 = (uint16_t)body_goal_for_servo(22, clamped_right);
     payload[0] = 12;
     payload[1] = (uint8_t)(goal12 & 0xFF);
     payload[2] = (uint8_t)(goal12 >> 8);
