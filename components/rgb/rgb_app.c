@@ -13,6 +13,46 @@
 
 static const char *TAG = "rgb_app";
 
+static void run_startup_self_test(void)
+{
+    const rgb_effect_config_t seq[] = {
+        {
+            .effect = RGB_EFFECT_SOLID,
+            .brightness = 96,
+            .speed_ms = BOARD_RGB_DEFAULT_SPEED_MS,
+            .r = 255,
+            .g = 0,
+            .b = 0,
+            .param = 0,
+        },
+        {
+            .effect = RGB_EFFECT_SOLID,
+            .brightness = 96,
+            .speed_ms = BOARD_RGB_DEFAULT_SPEED_MS,
+            .r = 0,
+            .g = 255,
+            .b = 0,
+            .param = 0,
+        },
+        {
+            .effect = RGB_EFFECT_SOLID,
+            .brightness = 96,
+            .speed_ms = BOARD_RGB_DEFAULT_SPEED_MS,
+            .r = 0,
+            .g = 0,
+            .b = 255,
+            .param = 0,
+        },
+    };
+
+    for (size_t i = 0; i < sizeof(seq) / sizeof(seq[0]); i++) {
+        ESP_ERROR_CHECK(rgb_service_set_effect(&seq[i]));
+        vTaskDelay(pdMS_TO_TICKS(220));
+    }
+
+    ESP_ERROR_CHECK(rgb_service_set_mode(RGB_EFFECT_OFF));
+}
+
 static void apply_default_effects(void)
 {
     // 默认效果参数（亮度/速度/颜色等）
@@ -48,6 +88,7 @@ void rgb_app_task(void *arg)
 
     // 设置默认效果参数（亮度/速度/颜色等）
     apply_default_effects();
+    run_startup_self_test();
 
     ESP_LOGI(TAG, "running");
 

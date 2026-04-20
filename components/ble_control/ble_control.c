@@ -228,21 +228,27 @@ static void status_balance_telemetry(bool quiet)
     if (quiet) {
         status_set_quiet(
             "{\"kind\":\"telemetry\",\"ok\":1,\"seq\":%lu,\"en\":%d,\"arm\":%d,\"guard\":%d,"
-            "\"theta\":%.3f,\"target\":%.3f,\"err\":%.3f,"
-            "\"rate\":%.3f,\"p\":%.3f,\"i\":%.3f,\"d\":%.3f,\"out\":%d,"
+            "\"zero\":%.3f,\"theta\":%.3f,\"target\":%.3f,\"err\":%.3f,"
+            "\"gx\":%.3f,\"rate\":%.3f,\"p\":%.3f,\"i\":%.3f,\"d\":%.3f,"
+            "\"raw\":%d,\"out\":%d,\"ff\":%d,\"yaw\":%d,"
             "\"ls\":%d,\"rs\":%d}",
             (unsigned long)tel.seq,
             tel.enabled ? 1 : 0,
             tel.armed ? 1 : 0,
             tel.in_tilt_guard ? 1 : 0,
+            (double)tel.zero_deg,
             (double)tel.theta_fb_deg,
             (double)tel.target_deg,
             (double)tel.error_deg,
+            (double)tel.gx_deg_s,
             (double)tel.rate_deg_s,
             (double)tel.p_term,
             (double)tel.i_term,
             (double)tel.d_term,
+            tel.raw_forward_speed,
             tel.forward_speed,
+            tel.feedforward_speed,
+            tel.yaw_speed,
             tel.wheel.left_speed,
             tel.wheel.right_speed);
         return;
@@ -250,21 +256,27 @@ static void status_balance_telemetry(bool quiet)
 
     status_set(
         "{\"kind\":\"telemetry\",\"ok\":1,\"seq\":%lu,\"en\":%d,\"arm\":%d,\"guard\":%d,"
-        "\"theta\":%.3f,\"target\":%.3f,\"err\":%.3f,"
-        "\"rate\":%.3f,\"p\":%.3f,\"i\":%.3f,\"d\":%.3f,\"out\":%d,"
+        "\"zero\":%.3f,\"theta\":%.3f,\"target\":%.3f,\"err\":%.3f,"
+        "\"gx\":%.3f,\"rate\":%.3f,\"p\":%.3f,\"i\":%.3f,\"d\":%.3f,"
+        "\"raw\":%d,\"out\":%d,\"ff\":%d,\"yaw\":%d,"
         "\"ls\":%d,\"rs\":%d}",
         (unsigned long)tel.seq,
         tel.enabled ? 1 : 0,
         tel.armed ? 1 : 0,
         tel.in_tilt_guard ? 1 : 0,
+        (double)tel.zero_deg,
         (double)tel.theta_fb_deg,
         (double)tel.target_deg,
         (double)tel.error_deg,
+        (double)tel.gx_deg_s,
         (double)tel.rate_deg_s,
         (double)tel.p_term,
         (double)tel.i_term,
         (double)tel.d_term,
+        tel.raw_forward_speed,
         tel.forward_speed,
+        tel.feedforward_speed,
+        tel.yaw_speed,
         tel.wheel.left_speed,
         tel.wheel.right_speed);
 }

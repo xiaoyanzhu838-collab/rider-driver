@@ -2,7 +2,10 @@
 from __future__ import annotations
 
 import asyncio
+import csv
 import json
+from datetime import datetime
+from pathlib import Path
 import queue
 import threading
 import tkinter as tk
@@ -181,10 +184,15 @@ class BalanceGui:
         self.telemetry_poll_enabled = False
         self.telemetry_poll_inflight = False
         self.stream_started = False
+        self.recording_enabled = False
+        self.record_path: Optional[Path] = None
+        self.record_fp: Optional[Any] = None
+        self.record_writer: Optional[csv.DictWriter] = None
 
         self.status_var = tk.StringVar(value="未连接")
         self.device_var = tk.StringVar()
         self.interval_var = tk.StringVar(value="100")
+        self.record_var = tk.StringVar(value="未采集")
 
         self.kp_var = tk.StringVar(value="4.4")
         self.ki_var = tk.StringVar(value="0.0")
@@ -197,7 +205,7 @@ class BalanceGui:
             key: tk.StringVar(value="--")
             for key in (
                 "theta", "target", "err", "rate",
-                "p", "i", "d", "out",
+                "gx", "raw", "p", "i", "d", "out",
                 "ls", "rs", "seq", "armed", "guard",
             )
         }
@@ -273,9 +281,14 @@ class BalanceGui:
         stream_frame.pack(side=tk.LEFT, fill=tk.Y)
         ttk.Label(stream_frame, text="间隔 ms").grid(row=0, column=0, padx=6, pady=6)
         ttk.Entry(stream_frame, textvariable=self.interval_var, width=8).grid(row=0, column=1, padx=6, pady=6)
-        ttk.Button(stream_frame, text="开始监看", command=self.start_stream).grid(row=1, column=0, padx=6, pady=6, sticky="ew")
-        ttk.Button(stream_frame, text="停止监看", command=self.stop_stream).grid(row=1, column=1, padx=6, pady=6, sticky="ew")
-        ttk.Button(stream_frame, text="抓一次", command=self.read_once).grid(row=2, column=0, columnspan=2, padx=6, pady=6, sticky="ew")
+        ttk.Button(stream_frame, text="开始推流", command=self.start_stream).grid(row=1, column=0, padx=6, pady=6, sticky="ew")
+        ttk.Button(stream_frame, text="停止推流", command=self.stop_stream).grid(row=1, column=1, padx=6, pady=6, sticky="ew")
+        ttk.Button(stream_frame, text="开始采集", command=self.start_recording).grid(row=2, column=0, padx=6, pady=6, sticky="ew")
+        ttk.Button(stream_frame, text="停止采集", command=self.stop_recording).grid(row=2, column=1, padx=6, pady=6, sticky="ew")
+        ttk.Button(stream_frame, text="抓一次", command=self.read_once).grid(row=3, column=0, columnspan=2, padx=6, pady=6, sticky="ew")
+        ttk.Label(stream_frame, textvariable=self.record_var, wraplength=180, justify="left").grid(
+            row=4, column=0, columnspan=2, padx=6, pady=(2, 6), sticky="w"
+        )
 
         body = ttk.Panedwindow(main, orient=tk.HORIZONTAL)
         body.pack(fill=tk.BOTH, expand=True)
@@ -288,7 +301,7 @@ class BalanceGui:
         fields = [
             ("Seq", "seq"), ("Armed", "armed"), ("Guard", "guard"),
             ("theta", "theta"), ("target", "target"), ("err", "err"), ("rate", "rate"),
-            ("P", "p"), ("I", "i"), ("D", "d"), ("out", "out"),
+            ("gx", "gx"), ("raw", "raw"), ("P", "p"), ("I", "i"), ("D", "d"), ("out", "out"),
             ("left_speed", "ls"), ("right_speed", "rs"),
         ]
 
@@ -355,6 +368,7 @@ class BalanceGui:
                 self.connected_address = str(payload)
                 self.telemetry_poll_enabled = False
                 self.stream_started = False
+                self._close_record_file()
                 self.status_var.set(f"已连接 {payload}")
                 self._append_log(f"已连接 {payload}")
                 self.read_pid()
@@ -371,18 +385,26 @@ class BalanceGui:
                 self.telemetry_poll_enabled = False
                 self.telemetry_poll_inflight = False
                 self.stream_started = False
+                self._close_record_file()
                 self.status_var.set("已断开")
                 self._append_log("蓝牙已断开")
             elif kind == "notify":
                 text, data = payload
                 if data and data.get("kind") == "telemetry":
                     self._update_telemetry(data)
+                    self._record_telemetry(data)
                 elif data and data.get("kind") == "pid":
                     self._update_pid(data)
                     self._append_log("PID 参数已更新")
                 elif data and data.get("kind") == "cfg_balance":
                     self._update_runtime_cfg(data)
                     self._append_log("响应参数已更新")
+                elif data and data.get("kind") == "btele":
+                    enabled = bool(data.get("enabled", 0))
+                    self.stream_started = enabled
+                    self._append_log(
+                        f"BLE 推流{'已开启' if enabled else '已关闭'}: interval={data.get('interval_ms', '--')}ms"
+                    )
                 else:
                     self._append_log(text)
         self.root.after(80, self._pump_events)
@@ -507,7 +529,9 @@ class BalanceGui:
             "theta": ("theta", 3),
             "target": ("target", 3),
             "err": ("err", 3),
+            "gx": ("gx", 3),
             "rate": ("rate", 3),
+            "raw": ("raw", 0),
             "p": ("p", 3),
             "i": ("i", 3),
             "d": ("d", 3),
@@ -614,13 +638,28 @@ class BalanceGui:
         )
 
     def start_stream(self) -> None:
-        self.telemetry_poll_enabled = True
-        self._append_log("已开始监看（本地轮询关键数据）")
+        try:
+            interval_ms = max(50, int(self.interval_var.get()))
+        except ValueError:
+            messagebox.showwarning("提示", "推流间隔必须是整数毫秒")
+            return
+
+        self.telemetry_poll_enabled = False
+        cmd = f"BTELE 1 {interval_ms}"
+        self._submit(
+            self.bridge.send_command(cmd, accepted_kinds=["btele"]),
+            lambda result: self._append_log(f"已请求开启 BLE 推流: {result[0]}"),
+            "开启 BLE 推流失败",
+        )
 
     def stop_stream(self) -> None:
         self.telemetry_poll_enabled = False
         self.telemetry_poll_inflight = False
-        self._append_log("已停止监看")
+        self._submit(
+            self.bridge.send_command("BTELE 0 100", accepted_kinds=["btele"]),
+            lambda result: self._append_log(f"已请求关闭 BLE 推流: {result[0]}"),
+            "关闭 BLE 推流失败",
+        )
 
     def set_board_log(self, enabled: bool) -> None:
         cmd = f"BLOG {1 if enabled else 0}"
@@ -630,7 +669,100 @@ class BalanceGui:
             "设置板端日志失败",
         )
 
+    def start_recording(self) -> None:
+        if self.recording_enabled:
+            messagebox.showinfo("提示", "已经在采集中了")
+            return
+
+        logs_dir = Path(__file__).resolve().parents[1] / "logs"
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        filename = f"balance_ble_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        path = logs_dir / filename
+        fp = path.open("w", newline="", encoding="utf-8-sig")
+        fieldnames = [
+            "pc_time",
+            "seq",
+            "en",
+            "arm",
+            "guard",
+            "zero",
+            "theta",
+            "target",
+            "err",
+            "gx",
+            "rate",
+            "p",
+            "i",
+            "d",
+            "raw",
+            "out",
+            "ff",
+            "yaw",
+            "ls",
+            "rs",
+        ]
+        writer = csv.DictWriter(fp, fieldnames=fieldnames)
+        writer.writeheader()
+        fp.flush()
+
+        self.record_path = path
+        self.record_fp = fp
+        self.record_writer = writer
+        self.recording_enabled = True
+        self.record_var.set(f"采集中: {path.name}")
+        self._append_log(f"开始采集: {path}")
+        self.start_stream()
+
+    def stop_recording(self) -> None:
+        was_recording = self.recording_enabled
+        self._close_record_file()
+        if was_recording:
+            self._append_log("已停止采集并关闭 CSV")
+
+    def _close_record_file(self) -> None:
+        self.recording_enabled = False
+        self.record_var.set("未采集")
+        if self.record_fp is not None:
+            try:
+                self.record_fp.flush()
+                self.record_fp.close()
+            except Exception:
+                pass
+        self.record_fp = None
+        self.record_writer = None
+        self.record_path = None
+
+    def _record_telemetry(self, payload: dict) -> None:
+        if not self.recording_enabled or self.record_writer is None or self.record_fp is None:
+            return
+
+        row = {
+            "pc_time": datetime.now().isoformat(timespec="milliseconds"),
+            "seq": payload.get("seq", ""),
+            "en": payload.get("en", ""),
+            "arm": payload.get("arm", ""),
+            "guard": payload.get("guard", ""),
+            "zero": payload.get("zero", ""),
+            "theta": payload.get("theta", ""),
+            "target": payload.get("target", ""),
+            "err": payload.get("err", ""),
+            "gx": payload.get("gx", ""),
+            "rate": payload.get("rate", ""),
+            "p": payload.get("p", ""),
+            "i": payload.get("i", ""),
+            "d": payload.get("d", ""),
+            "raw": payload.get("raw", ""),
+            "out": payload.get("out", ""),
+            "ff": payload.get("ff", ""),
+            "yaw": payload.get("yaw", ""),
+            "ls": payload.get("ls", ""),
+            "rs": payload.get("rs", ""),
+        }
+        self.record_writer.writerow(row)
+        self.record_fp.flush()
+
     def _on_close(self) -> None:
+        self._close_record_file()
         try:
             self.bridge.submit(self.bridge.disconnect()).result(timeout=2)
         except Exception:
